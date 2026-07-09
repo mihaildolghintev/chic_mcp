@@ -1,7 +1,8 @@
-# Template for .kamal/secrets (which is gitignored — it holds RAW values).
-# Copy and fill in:
+# Template for .envrc (which is gitignored — it holds RAW values).
+# Only needed for deploying from the laptop; CI takes the same values
+# from GitHub Actions secrets. Copy and fill in:
 #
-#   cp .kamal/secrets.example .kamal/secrets
+#   cp .envrc.example .envrc
 #
 # KAMAL_REGISTRY_PASSWORD  — GitHub PAT (classic) with read:packages + write:packages
 # TELEGRAM_BOT_TOKEN       — from @BotFather
@@ -9,8 +10,8 @@
 # ALLOWED_USER_IDS         — comma-separated Telegram user ids (ask @userinfobot)
 # MOYSKLAD_TOKEN           — MoySklad access token (Settings -> Users -> Access tokens)
 
-KAMAL_REGISTRY_PASSWORD=ghp_...
-TELEGRAM_BOT_TOKEN=123456:AA...
-TELEGRAM_WEBHOOK_SECRET=
-ALLOWED_USER_IDS=
-MOYSKLAD_TOKEN=
+export KAMAL_REGISTRY_PASSWORD=ghp_...
+export TELEGRAM_BOT_TOKEN=123456:AA...
+export TELEGRAM_WEBHOOK_SECRET=
+export ALLOWED_USER_IDS=
+export MOYSKLAD_TOKEN=
