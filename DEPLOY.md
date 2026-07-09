@@ -97,6 +97,11 @@ kamal-proxy, then deploys). The current box is already set up.
 - `Permission denied (publickey)` in the Deploy workflow — `DEPLOY_SSH_KEY`
   secret is wrong/incomplete (it must include the `-----BEGIN/END OPENSSH
   PRIVATE KEY-----` lines) or the public half is missing from the server.
+- `Net::SSH::HostKeyMismatch` in the Deploy workflow — the server's ed25519
+  host key is pinned in [deploy.yml](.github/workflows/deploy.yml) ("Trust
+  server host key" step). If the box was reinstalled, refresh the pinned line
+  with `ssh-keyscan -t ed25519 204.168.131.104`; if it wasn't, treat the
+  mismatch as a real warning and investigate before trusting the new key.
 - Missing env var error from kamal — a secret wasn't set (GitHub secret names
   must match [.kamal/secrets](.kamal/secrets) exactly).
 - Two deploys collided — the workflow serializes via a concurrency group and

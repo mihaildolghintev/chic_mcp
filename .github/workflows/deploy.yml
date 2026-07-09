@@ -31,11 +31,10 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
-      - name: Trust server host key
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H 204.168.131.104 >> ~/.ssh/known_hosts
-
+      # No known_hosts setup on purpose: net-ssh's default verifier is
+      # accept-new, so the fresh runner trusts the host on first connection.
+      # Do NOT add an ssh-keyscan step — its probes get rate-limited from
+      # runner IPs and a partial key list turns into HostKeyMismatch.
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
