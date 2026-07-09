@@ -128,25 +128,28 @@ func runBot() {
 	}
 	addr := envOr("LISTEN_ADDR", ":8080")
 
-	tg := telegram.NewClient(botToken)
-	webhook := telegram.NewWebhook(webhookSecret, 64, slog.Default())
-	bot := telegram.NewBot(tg, allowed, telegram.Echo(), 4, slog.Default())
+	// telegram.New calls getMe under the hood — a bad token fails fast here,
+	// before anything is served.
+	bot, err := telegram.New(botToken, webhookSecret, allowed, telegram.Echo(), 4, slog.Default())
+	if err != nil {
+		slog.Error("telegram init failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Fail fast on a bad token before serving anything.
-	me, err := tg.GetMe(ctx)
+	me, err := bot.Me(ctx)
 	if err != nil {
-		slog.Error("telegram getMe failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
+		slog.Error("telegram getMe failed", "err", err)
 		os.Exit(1)
 	}
 	slog.Info("telegram bot authenticated", "username", me.Username, "id", me.ID)
 
 	mux := http.NewServeMux()
 	// The webhook path embeds the secret as a first barrier; the header check
-	// inside the handler is the authoritative one.
-	mux.Handle("/tg/"+webhookSecret, webhook)
+	// inside the library's handler is the authoritative one.
+	mux.Handle("/tg/"+webhookSecret, bot.WebhookHandler())
 
 	// Liveness probe, deliberately unauthenticated so kamal-proxy/monitors/
 	// Docker can reach it. Process health only — no upstream calls.
@@ -179,14 +182,14 @@ func runBot() {
 	// Register the webhook only after the server is up, so Telegram's first
 	// delivery attempt doesn't hit a closed port. Idempotent on re-deploys.
 	webhookURL := publicBaseURL + "/tg/" + webhookSecret
-	if err := tg.SetWebhook(ctx, webhookURL, webhookSecret, []string{"message"}); err != nil {
+	if err := bot.RegisterWebhook(ctx, webhookURL); err != nil {
 		slog.Error("setWebhook failed", "err", err)
 		os.Exit(1)
 	}
 	slog.Info("telegram webhook registered", "url", publicBaseURL+"/tg/***")
 
 	workersDone := make(chan struct{})
-	go func() { bot.Run(ctx, webhook.Updates()); close(workersDone) }()
+	go func() { bot.StartWebhook(ctx); close(workersDone) }()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
