@@ -141,26 +141,13 @@ smoke test.
 
 ## Deploy
 
-Runs on a single Hetzner box shared with other small services (Telegram
-backends, webhooks). A shared **edge proxy** (`caddy-docker-proxy`, in a
-separate infra repo) terminates TLS for every app and routes to this container
-by the `caddy.*` labels in `docker-compose.yml` — no central Caddyfile to edit.
+Kamal 2 to a Hetzner box, fronted by kamal-proxy with Let's Encrypt for
+`bot.chic.md`. `main` is merged freely (CI only); production deploys when a
+GitHub Release is published — the Deploy workflow builds the image, pushes it
+to a private GHCR package and runs `kamal deploy` over SSH.
 
-Flow:
-
-1. CI (lint + test + security) runs on every push.
-2. On green CI on `main`, the **Deploy** workflow builds the image, pushes it to
-   `ghcr.io/mihaildolghintev/chic_mcp`, copies `docker-compose.yml` to the box,
-   and runs `docker compose pull && up -d` over SSH.
-3. The server holds only `docker-compose.yml` + `.env` (secrets) at `/srv/mcp`
-   and the shared external `edge` network — no source, no local build.
-
-First-time server setup (Docker, firewall, `edge` network, DNS, deploy user,
-GitHub secrets, the edge proxy) lives in the infra repo's runbook. Required
-GitHub Actions secrets: `SSH_HOST`, `SSH_USER`, `SSH_KEY`. Point an `A` record
-for `mcp.chic.md` at the box before the first deploy so Let's Encrypt can issue
-the cert. Set `MOYSKLAD_TOKEN`, `MCP_BEARER_TOKEN`, `OAUTH_PASSWORD` in the
-server's `.env` (see `.env.example`).
+Full runbook — release flow, secrets, manual deploys, rollback,
+troubleshooting: [DEPLOY.md](DEPLOY.md).
 
 ## Connect a client
 

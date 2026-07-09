@@ -1,6 +1,8 @@
 # Kamal 2 deployment: one Go binary on the Hetzner box, fronted by
 # kamal-proxy which owns 80/443 and the Let's Encrypt certificate for
-# bot.chic.md. Deploy with `kamal deploy` (first time: `kamal setup`).
+# bot.chic.md. Deploys run from CI when a GitHub Release is published
+# (.github/workflows/deploy.yml); manual `kamal deploy` from the laptop
+# still works via .envrc (first time: `kamal setup`).
 service: chic
 
 image: mihaildolghintev/chic
@@ -21,14 +23,14 @@ registry:
   server: ghcr.io
   username: mihaildolghintev
   # GitHub PAT with read:packages + write:packages. Kamal pushes from the
-  # laptop and logs the server in with the same credential, so the GHCR
-  # package can stay private.
+  # deploying machine (CI runner or laptop) and logs the server in with the
+  # same credential, so the GHCR package can stay private.
   password:
     - KAMAL_REGISTRY_PASSWORD
 
 builder:
-  # The box is x86; the laptop is Apple Silicon. Cross-build only the target
-  # arch (pure-Go binary, so no CGO cross-compilation pain).
+  # The box is x86. Native build on CI runners; cross-build from the Apple
+  # Silicon laptop (pure-Go binary, so no CGO cross-compilation pain).
   arch: amd64
   args:
     VERSION: <%= `git describe --tags --always`.strip %>
