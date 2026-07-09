@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -140,7 +141,11 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 
+	// Agent answers take seconds to minutes; keep the "typing…" indicator
+	// alive (Telegram drops it after ~5s) until the handler returns.
+	stopTyping := b.startTyping(ctx, msg.Chat.ID)
 	text, err := b.handler.Handle(ctx, msg)
+	stopTyping()
 	if err != nil {
 		log.Error("handler failed", "err", err)
 		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.")
@@ -152,10 +157,71 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	b.reply(ctx, log, msg.Chat.ID, text)
 }
 
+// maxMessageLen is Telegram's hard cap on sendMessage text.
+const maxMessageLen = 4096
+
 func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string) {
-	if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text}); err != nil {
-		log.Error("sendMessage failed", "err", err)
+	for _, chunk := range splitMessage(text, maxMessageLen) {
+		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunk}); err != nil {
+			log.Error("sendMessage failed", "err", err)
+			return
+		}
 	}
+}
+
+// splitMessage cuts text into <=limit-rune chunks, preferring to break on the
+// last newline of a window so lists and paragraphs survive the split.
+func splitMessage(text string, limit int) []string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return []string{text}
+	}
+	var out []string
+	for len(runes) > limit {
+		cut := limit
+		for i := limit; i > limit/2; i-- {
+			if runes[i-1] == '\n' {
+				cut = i
+				break
+			}
+		}
+		out = append(out, strings.TrimRight(string(runes[:cut]), "\n"))
+		runes = runes[cut:]
+	}
+	if rest := strings.TrimRight(string(runes), "\n"); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}
+
+// startTyping shows the typing indicator now and re-sends it every few
+// seconds until the returned stop function is called.
+func (b *Bot) startTyping(ctx context.Context, chatID int64) (stop func()) {
+	send := func() {
+		if _, err := b.api.SendChatAction(ctx, &bot.SendChatActionParams{
+			ChatID: chatID,
+			Action: models.ChatActionTyping,
+		}); err != nil {
+			b.logger.Debug("sendChatAction failed", "err", err)
+		}
+	}
+	send()
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(4 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				send()
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 // ParseAllowedIDs parses the comma-separated ALLOWED_USER_IDS env value

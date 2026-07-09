@@ -49,4 +49,8 @@ jobs:
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           MOYSKLAD_TOKEN: ${{ secrets.MOYSKLAD_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # Not created yet — resolves to "" and vision stays disabled until
+          # the secret exists. No workflow change needed then.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: kamal deploy

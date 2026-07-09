@@ -1,34 +1,31 @@
-# MoySklad MCP Server
+# chic — MoySklad AI bot
 
-Remote [MCP](https://modelcontextprotocol.io) server (Go) that lets LLM clients
-(Claude, Antigravity, Cursor…) query MoySklad documents, stock and reports via
-tools. Hosted behind Caddy on `https://mcp.chic.md`, transport is **Streamable
-HTTP**.
+A Go monolith: a private Telegram bot that answers business questions about a
+MoySklad account. Messages go to an LLM agent (DeepSeek for text, OpenAI for
+photos) that calls 15 read-only MoySklad [MCP](https://modelcontextprotocol.io)
+tools in-process and replies in plain Russian. Deployed with Kamal to
+`bot.chic.md`.
 
-## Status
+## How it works
 
-Foundation in place and tested end-to-end:
+```
+Telegram webhook ──► allowlist / dedupe / typing… ──► agent
+                                                       │  chat loop (≤6 rounds)
+                     DeepSeek (text) / OpenAI (vision) ◄┼─► MCP client (in-process)
+                                                       │        │
+                     SQLite app.db (dialog history) ◄──┘        ▼
+                                                       mcpserver: 15 tools
+                                                                │
+                                              SQLite cache.db (TTL) ──► MoySklad API
+```
 
-- MoySklad HTTP client — static Bearer auth, `45 req / 3s` rate limiter, retry
-  with backoff on 429/5xx, offset/limit pagination, `expand`/`filter`/`search`.
-- Aggregation layer — compact LLM-friendly structs; **kopecks→rubles conversion
-  is centralized here and nowhere else**.
-- MCP server over Streamable HTTP with 15 tools (see below) — data access plus
-  analytics (ABC, segmentation, dead stock, period comparison, AR aging).
-- Auth — static Bearer for simple clients (Antigravity, Cursor) **and** a
-  single-user OAuth 2.1 server for Claude: RFC 9728 / RFC 8414 discovery,
-  RFC 7591 dynamic client registration, PKCE (S256) authorization-code grant
-  behind a password login, and refresh tokens. Both token classes share one
-  verifier chain guarding `/mcp`.
-
-- Response cache — an optional SQLite (CGO-free, `modernc.org/sqlite`) TTL cache
-  that wraps the client, so repeated/similar analytical queries don't re-hit the
-  rate-limited API. Caches exactly what MoySklad returns (no report math is
-  recomputed locally); persists across restarts. Enabled via `CACHE_DB`.
-
-Not yet built: proactive background sync/warming (the cache is populated lazily
-on first request). Note this is a pull-only MCP server — proactive alerts and
-scheduled digests would require a separate scheduler/notifier, out of scope here.
+- The MCP server is the same one `-transport stdio` serves to local clients —
+  the bot dogfoods the exact public tool surface.
+- Dialog history lives in `app.db` (durable, on the volume); MoySklad responses
+  are cached in `cache.db` (regenerable, TTL per endpoint).
+- Guardrails: per-chat hourly rate limit, per-request token stop-loss, round
+  cap, 20 MB photo limit. All tools are read-only, so there are no mutations to
+  confirm.
 
 ## Tools
 
@@ -70,27 +67,42 @@ predictive model.
 
 ```
 cmd/server           entrypoint (env config, graceful shutdown)
+internal/telegram    webhook bot: allowlist, dedupe, typing, photo download
+internal/agent       LLM⇄MCP chat loop, rate limit, token stop-loss
+internal/llm         OpenAI-compatible client (DeepSeek + OpenAI, vision routing)
+internal/store       app.db — durable dialog history
 internal/moysklad    API client + golden-file tests
 internal/aggregate   raw MoySklad -> compact structs (kopecks -> rubles)
 internal/mcpserver   MCP tool definitions + transport
-internal/auth        Bearer middleware + verifier chain
-internal/oauth       single-user OAuth 2.1 server for Claude
-internal/cache       SQLite TTL response cache (decorator over the client)
+internal/cache       cache.db — SQLite TTL response cache (decorator over the client)
 ```
+
+## Modes
+
+The binary picks a mode via `-transport` (or `MCP_TRANSPORT`), default `bot`:
+
+- `bot` — production: Telegram webhook + `/healthz` + the LLM agent. Requires
+  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_IDS`,
+  `PUBLIC_BASE_URL`, `MOYSKLAD_TOKEN` and at least one of `DEEPSEEK_API_KEY` /
+  `OPENAI_API_KEY` (photos need the OpenAI one).
+- `stdio` — the MoySklad MCP server alone over stdin/stdout, for local MCP
+  clients and inspection; only `MOYSKLAD_TOKEN` required.
+
+All knobs are documented in [.env.example](.env.example).
 
 ## Run locally (macOS, Apple Silicon)
 
 Pure Go, no CGO — `make build` produces a native `arm64` binary with no runtime
-dependencies. The easy local path is the **stdio** transport: your client
-launches the binary directly, no ports/tokens/TLS.
+dependencies.
 
 ```sh
 make build          # -> bin/moysklad-mcp (darwin/arm64)
 make test           # full suite with -race
+make run-bot        # webhook bot on :8080 (pair with a cloudflared tunnel)
 make config         # installs the binary and prints a Claude Desktop config
 ```
 
-### Claude Desktop
+### Claude Desktop / Cursor / other stdio clients
 
 `make config` installs to `~/.local/bin/moysklad-mcp` and prints a snippet to
 paste into `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -110,34 +122,21 @@ paste into `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop; the MoySklad tools appear. `CACHE_DB` is optional (enables
-the response cache). No auth is needed over stdio — it's a local, trusted pipe.
-
-### Cursor / other stdio clients
-
-Same idea — point the client at the binary with `-transport stdio` and set
-`MOYSKLAD_TOKEN` in its env.
-
-### Transports
-
-The binary picks a transport via `-transport` (or `MCP_TRANSPORT`), default
-`stdio`:
-
-- `stdio` — local; only `MOYSKLAD_TOKEN` required.
-- `http` — remote Streamable HTTP on `:8080/mcp`; also requires
-  `MCP_BEARER_TOKEN`, and enables Claude OAuth when `PUBLIC_BASE_URL` +
-  `OAUTH_PASSWORD` are set. Used by the Docker deploy below.
+Restart Claude Desktop; the MoySklad tools appear. `CACHE_DB` is optional
+(enables the response cache). No auth is needed over stdio — it's a local,
+trusted pipe.
 
 ## Test
 
 ```sh
-go test ./...
+go test -race ./...
 ```
 
 Test layers: golden-file client tests (`httptest` + recorded MoySklad JSON),
 aggregation unit tests (kopecks/rubles, empty cases), in-process MCP protocol
-tests (`tools/list`, `tools/call`, schema validity), and a real-HTTP transport
-smoke test.
+tests (`tools/list`, `tools/call`, schema validity), LLM payload tests for both
+providers, and an end-to-end agent test (scripted LLM → real MCP → fake
+MoySklad).
 
 ## Deploy
 
@@ -148,60 +147,3 @@ to a private GHCR package and runs `kamal deploy` over SSH.
 
 Full runbook — release flow, secrets, manual deploys, rollback,
 troubleshooting: [DEPLOY.md](DEPLOY.md).
-
-## Connect a client
-
-The MCP endpoint is `https://mcp.chic.md/mcp` (Streamable HTTP). There are two
-ways to authenticate, depending on the client.
-
-### Claude (Desktop / claude.ai / mobile) — OAuth
-
-Claude drives the OAuth flow itself; you never paste a token.
-
-1. **Settings → Connectors → Add custom connector**.
-2. Name it (e.g. `MoySklad`) and set the URL to `https://mcp.chic.md/mcp`.
-3. Click **Connect**. A browser page opens asking for a password — enter your
-   `OAUTH_PASSWORD`. Claude receives a token and the tools appear.
-
-> Requires `PUBLIC_BASE_URL` and `OAUTH_PASSWORD` to be set on the server.
-> Because tokens are held in memory, a server restart signs Claude out and you
-> reconnect with the same steps.
-
-### Cursor, Antigravity, and other clients — static Bearer token
-
-These clients send the static `MCP_BEARER_TOKEN` in an `Authorization` header.
-
-**Cursor** — add to `~/.cursor/mcp.json` (or a project's `.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "moysklad": {
-      "url": "https://mcp.chic.md/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_MCP_BEARER_TOKEN"
-      }
-    }
-  }
-}
-```
-
-**Antigravity** and other clients that accept a remote HTTP MCP server use the
-same two fields: URL `https://mcp.chic.md/mcp` and header
-`Authorization: Bearer YOUR_MCP_BEARER_TOKEN`.
-
-**Claude Code (CLI)** — one command:
-
-```sh
-claude mcp add --transport http moysklad https://mcp.chic.md/mcp \
-  --header "Authorization: Bearer YOUR_MCP_BEARER_TOKEN"
-```
-
-> A client that only supports stdio can bridge to this remote server with
-> [`mcp-remote`](https://github.com/geelen/mcp-remote):
-> `npx mcp-remote https://mcp.chic.md/mcp --header "Authorization: Bearer YOUR_MCP_BEARER_TOKEN"`.
-
-### Verify the connection
-
-Once connected, ask the client something like *"list products containing coffee"*
-— it should call `list_products` and return catalog rows with ruble prices.

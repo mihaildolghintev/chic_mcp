@@ -9,9 +9,13 @@
 # TELEGRAM_WEBHOOK_SECRET  — `openssl rand -hex 32`, generate once and keep
 # ALLOWED_USER_IDS         — comma-separated Telegram user ids (ask @userinfobot)
 # MOYSKLAD_TOKEN           — MoySklad access token (Settings -> Users -> Access tokens)
+# DEEPSEEK_API_KEY         — platform.deepseek.com; the agent's text model
+# OPENAI_API_KEY           — optional, enables photo understanding (vision)
 
 export KAMAL_REGISTRY_PASSWORD=ghp_...
 export TELEGRAM_BOT_TOKEN=123456:AA...
 export TELEGRAM_WEBHOOK_SECRET=
 export ALLOWED_USER_IDS=
 export MOYSKLAD_TOKEN=
+export DEEPSEEK_API_KEY=
+export OPENAI_API_KEY=

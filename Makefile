@@ -44,12 +44,18 @@ run-stdio: build
 	$(BIN_DIR)/$(BINARY) -transport stdio
 
 ## run-bot: run the Telegram bot locally on :8080 (pair with a cloudflared
-## tunnel; PUBLIC_BASE_URL must be the tunnel's https URL)
+## tunnel; PUBLIC_BASE_URL must be the tunnel's https URL). OPENAI_API_KEY is
+## optional — it enables photo understanding.
 run-bot: build
+	@mkdir -p $(CACHE_DIR)
 	TELEGRAM_BOT_TOKEN=$${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN} \
 	TELEGRAM_WEBHOOK_SECRET=$${TELEGRAM_WEBHOOK_SECRET:?set TELEGRAM_WEBHOOK_SECRET} \
 	ALLOWED_USER_IDS=$${ALLOWED_USER_IDS:?set ALLOWED_USER_IDS} \
 	PUBLIC_BASE_URL=$${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the tunnel url} \
+	MOYSKLAD_TOKEN=$${MOYSKLAD_TOKEN:?set MOYSKLAD_TOKEN} \
+	DEEPSEEK_API_KEY=$${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY} \
+	CACHE_DB=$(CACHE_DIR)/cache.db \
+	APP_DB=$(CACHE_DIR)/app.db \
 	$(BIN_DIR)/$(BINARY)
 
 ## config: print a ready-to-paste Claude Desktop connector config
