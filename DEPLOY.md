@@ -55,6 +55,8 @@ live in **two places that must be kept in sync**:
 | `TELEGRAM_WEBHOOK_SECRET` | `openssl rand -hex 32`. The app registers it with Telegram via `SetWebhook` on every start, so rotating it only requires a redeploy. |
 | `ALLOWED_USER_IDS` | Comma-separated Telegram user ids. |
 | `MOYSKLAD_TOKEN` | MoySklad access token. |
+| `DEEPSEEK_API_KEY` | platform.deepseek.com — the agent's text model. |
+| `OPENAI_API_KEY` | Optional: enables photo understanding (vision). Absent secret deploys as an empty value and vision stays off. |
 
 If a value changes in one place, change it in the other — a laptop deploy with
 a stale `.envrc` will silently push the old value back to production.

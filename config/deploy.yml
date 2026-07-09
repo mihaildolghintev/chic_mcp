@@ -40,15 +40,20 @@ env:
     PUBLIC_BASE_URL: https://bot.chic.md
     LISTEN_ADDR: ":8080"
     CACHE_DB: /data/cache.db
+    APP_DB: /data/app.db
     LOG_FORMAT: json
   secret:
     - TELEGRAM_BOT_TOKEN
     - TELEGRAM_WEBHOOK_SECRET
     - ALLOWED_USER_IDS
     - MOYSKLAD_TOKEN
+    - DEEPSEEK_API_KEY
+    # Optional: enables photo understanding. Empty until the GitHub secret is
+    # created — the app treats an empty value as "not configured".
+    - OPENAI_API_KEY
 
-# Persistent SQLite files (response cache now; app.db with conversation
-# history in the next milestone) survive deploys on a named volume.
+# Persistent SQLite files (regenerable cache.db + durable app.db with the
+# conversation history) survive deploys on a named volume.
 volumes:
   - "chic_data:/data"
 

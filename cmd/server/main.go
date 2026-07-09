@@ -11,7 +11,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,12 +22,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-telegram/bot/models"
 	"github.com/mark3labs/mcp-go/server"
 
+	"mcp.chic.md/internal/agent"
 	"mcp.chic.md/internal/buildinfo"
 	"mcp.chic.md/internal/cache"
+	"mcp.chic.md/internal/llm"
 	"mcp.chic.md/internal/mcpserver"
 	"mcp.chic.md/internal/moysklad"
+	"mcp.chic.md/internal/store"
 	"mcp.chic.md/internal/telegram"
 )
 
@@ -114,9 +120,8 @@ func buildAPI(token string) (mcpserver.MoyskladAPI, func()) {
 	}
 }
 
-// runBot is the production mode: Telegram webhook + worker pool + /healthz.
-// The handler is a plain echo for now; the MCP-backed LLM agent replaces it in
-// the next milestone.
+// runBot is the production mode: Telegram webhook + worker pool + /healthz,
+// with the MCP-backed LLM agent answering messages.
 func runBot() {
 	botToken := requireEnv("TELEGRAM_BOT_TOKEN")
 	webhookSecret := requireEnv("TELEGRAM_WEBHOOK_SECRET")
@@ -128,16 +133,63 @@ func runBot() {
 	}
 	addr := envOr("LISTEN_ADDR", ":8080")
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	api, closeCache := buildAPI(requireEnv("MOYSKLAD_TOKEN"))
+	defer closeCache()
+
+	llmClient, err := llm.FromEnv()
+	if err != nil {
+		slog.Error("llm config", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("llm configured", "vision", llmClient.HasVision())
+
+	// app.db is durable state (dialog memory), unlike the regenerable cache.
+	appDB, err := store.Open(envOr("APP_DB", "app.db"))
+	if err != nil {
+		slog.Error("open app db", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = appDB.Close() }()
+
+	ag, err := agent.New(ctx, llmClient, mcpserver.New(api), appDB, agent.Options{})
+	if err != nil {
+		slog.Error("agent init", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = ag.Close() }()
+
+	// The handler needs the bot for photo downloads, and the bot needs the
+	// handler at construction — the closure captures the variable assigned
+	// right below, before any update is served.
+	var bot *telegram.Bot
+	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (string, error) {
+		text, imageURI := msg.Text, ""
+		if len(msg.Photo) > 0 {
+			uri, err := bot.PhotoDataURI(ctx, msg)
+			if errors.Is(err, telegram.ErrPhotoTooLarge) {
+				return "Фото слишком большое, лимит 20 МБ.", nil
+			}
+			if err != nil {
+				return "", fmt.Errorf("photo download: %w", err)
+			}
+			text, imageURI = msg.Caption, uri
+		}
+		if text == "" && imageURI == "" {
+			return "Я понимаю текст и фотографии.", nil
+		}
+		return ag.Handle(ctx, msg.Chat.ID, text, imageURI)
+	})
+
 	// telegram.New calls getMe under the hood — a bad token fails fast here,
 	// before anything is served.
-	bot, err := telegram.New(botToken, webhookSecret, allowed, telegram.Echo(), 4, slog.Default())
+	bot, err = telegram.New(botToken, webhookSecret, allowed, handler, 4, slog.Default())
 	if err != nil {
 		slog.Error("telegram init failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
 		os.Exit(1)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	me, err := bot.Me(ctx)
 	if err != nil {
