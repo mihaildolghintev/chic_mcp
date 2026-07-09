@@ -15,15 +15,21 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags="-s -w -X mcp.chic.md/internal/buildinfo.Version=${VERSION}" \
     -o /out/server ./cmd/server
+# Staging dir for the runtime /data mount point (see COPY --chown below).
+RUN mkdir -p /out/data
 
 # Runtime stage
 FROM gcr.io/distroless/static-debian13:nonroot
 WORKDIR /app
 COPY --from=build /out/server /app/server
+# Pre-create /data owned by nonroot: a fresh named volume mounted there
+# inherits this ownership, so SQLite can create its files (no shell in
+# distroless to chown at runtime).
+COPY --from=build --chown=nonroot:nonroot /out/data /data
 EXPOSE 8080
 USER nonroot:nonroot
-# No shell/curl in distroless — the binary probes its own /healthz. Only
-# meaningful for the http transport (the compose service runs it).
+# No shell/curl in distroless — the binary probes its own /healthz (bot mode,
+# the container default).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/app/server", "-health-check"]
 ENTRYPOINT ["/app/server"]

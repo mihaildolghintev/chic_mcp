@@ -1,11 +1,11 @@
-// Command server runs the MoySklad MCP server. It supports two transports:
+// Command server runs the chic monolith. It has two modes:
 //
-//	stdio — for local use: a client (Claude Desktop, Cursor) launches this
-//	        binary and talks over stdin/stdout. No ports, tokens or TLS.
-//	http  — Streamable HTTP for remote hosting, guarded by a static Bearer
-//	        token and (optionally) single-user OAuth 2.1 for Claude.
+//	bot   — the production default: a Telegram bot served over a webhook
+//	        (route /tg/<secret> behind kamal-proxy TLS) plus /healthz.
+//	stdio — the MoySklad MCP server alone over stdin/stdout, for inspecting
+//	        the exact tool surface the bot dogfoods (mcp-inspector, tests).
 //
-// Select with -transport (or MCP_TRANSPORT); default is stdio.
+// Select with -transport (or MCP_TRANSPORT); default is bot.
 package main
 
 import (
@@ -22,18 +22,17 @@ import (
 
 	"github.com/mark3labs/mcp-go/server"
 
-	"mcp.chic.md/internal/auth"
 	"mcp.chic.md/internal/buildinfo"
 	"mcp.chic.md/internal/cache"
 	"mcp.chic.md/internal/mcpserver"
 	"mcp.chic.md/internal/moysklad"
-	"mcp.chic.md/internal/oauth"
+	"mcp.chic.md/internal/telegram"
 )
 
 func main() {
 	slog.SetDefault(newLogger())
 
-	transport := flag.String("transport", envOr("MCP_TRANSPORT", "stdio"), "transport: stdio or http")
+	transport := flag.String("transport", envOr("MCP_TRANSPORT", "bot"), "mode: bot or stdio")
 	healthCheck := flag.Bool("health-check", false, "probe /healthz on the local server and exit 0/1 (for container HEALTHCHECK)")
 	flag.Parse()
 
@@ -41,30 +40,21 @@ func main() {
 		os.Exit(runHealthCheck())
 	}
 
-	slog.Info("moysklad mcp starting", "build", buildinfo.Get(), "transport", *transport)
-
-	token := os.Getenv("MOYSKLAD_TOKEN")
-	if token == "" {
-		slog.Error("MOYSKLAD_TOKEN is required")
-		os.Exit(1)
-	}
-
-	api, closeCache := buildAPI(token)
-	defer closeCache()
+	slog.Info("chic starting", "build", buildinfo.Get(), "mode", *transport)
 
 	switch *transport {
+	case "bot":
+		runBot()
 	case "stdio":
-		runStdio(api)
-	case "http":
-		runHTTP(api)
+		runStdio()
 	default:
-		slog.Error("unknown transport", "transport", *transport, "want", "stdio or http")
+		slog.Error("unknown mode", "mode", *transport, "want", "bot or stdio")
 		os.Exit(1)
 	}
 }
 
 // newLogger builds the process logger. It always writes to stderr — in stdio
-// transport the MCP protocol owns stdout, so logs must never touch it. Set
+// mode the MCP protocol owns stdout, so logs must never touch it. Set
 // LOG_FORMAT=json for machine-readable output (default is human-readable text)
 // and LOG_LEVEL=debug|info|warn|error to set the minimum level (default info).
 func newLogger() *slog.Logger {
@@ -87,6 +77,17 @@ func parseLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// requireEnv reads an env var or exits — all bot-mode config is fail-fast so a
+// misconfigured deploy dies loudly instead of half-working.
+func requireEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		slog.Error("required environment variable is not set", "var", key)
+		os.Exit(1)
+	}
+	return v
 }
 
 // buildAPI wraps the client in a TTL cache when CACHE_DB is set; the returned
@@ -113,29 +114,42 @@ func buildAPI(token string) (mcpserver.MoyskladAPI, func()) {
 	}
 }
 
-func runStdio(api mcpserver.MoyskladAPI) {
-	slog.Info("serving MoySklad MCP over stdio")
-	if err := server.ServeStdio(mcpserver.New(api)); err != nil {
-		slog.Error("stdio server error", "err", err)
-		os.Exit(1)
-	}
-}
-
-func runHTTP(api mcpserver.MoyskladAPI) {
-	bearer := os.Getenv("MCP_BEARER_TOKEN")
-	if bearer == "" {
-		slog.Error("MCP_BEARER_TOKEN is required for http transport (static Bearer token for simple clients)")
+// runBot is the production mode: Telegram webhook + worker pool + /healthz.
+// The handler is a plain echo for now; the MCP-backed LLM agent replaces it in
+// the next milestone.
+func runBot() {
+	botToken := requireEnv("TELEGRAM_BOT_TOKEN")
+	webhookSecret := requireEnv("TELEGRAM_WEBHOOK_SECRET")
+	publicBaseURL := strings.TrimRight(requireEnv("PUBLIC_BASE_URL"), "/")
+	allowed, err := telegram.ParseAllowedIDs(requireEnv("ALLOWED_USER_IDS"))
+	if err != nil {
+		slog.Error("ALLOWED_USER_IDS", "err", err)
 		os.Exit(1)
 	}
 	addr := envOr("LISTEN_ADDR", ":8080")
-	publicBaseURL := strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/")
 
-	mcpHandler := mcpserver.NewStreamableHTTP(api)
+	tg := telegram.NewClient(botToken)
+	webhook := telegram.NewWebhook(webhookSecret, 64, slog.Default())
+	bot := telegram.NewBot(tg, allowed, telegram.Echo(), 4, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Fail fast on a bad token before serving anything.
+	me, err := tg.GetMe(ctx)
+	if err != nil {
+		slog.Error("telegram getMe failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("telegram bot authenticated", "username", me.Username, "id", me.ID)
+
 	mux := http.NewServeMux()
+	// The webhook path embeds the secret as a first barrier; the header check
+	// inside the handler is the authoritative one.
+	mux.Handle("/tg/"+webhookSecret, webhook)
 
-	// Liveness probe, deliberately unauthenticated so Caddy/monitors/Docker can
-	// reach it without a token. It reports process health only (no upstream call
-	// to MoySklad, which would burn the account rate limit on every probe).
+	// Liveness probe, deliberately unauthenticated so kamal-proxy/monitors/
+	// Docker can reach it. Process health only — no upstream calls.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		body, _ := json.Marshal(map[string]any{
 			"status": "ok",
@@ -146,49 +160,58 @@ func runHTTP(api mcpserver.MoyskladAPI) {
 		_, _ = w.Write(body)
 	})
 
-	authCfg := auth.Config{Verifiers: []auth.Verifier{auth.NewStaticToken(bearer)}}
-
-	if publicBaseURL != "" && os.Getenv("OAUTH_PASSWORD") != "" {
-		oauthSrv := oauth.New(oauth.Config{
-			Issuer:   publicBaseURL,
-			Password: os.Getenv("OAUTH_PASSWORD"),
-		})
-		oauthSrv.RegisterRoutes(mux)
-		authCfg.Verifiers = append(authCfg.Verifiers, oauthSrv)
-		authCfg.ResourceMetadataURL = publicBaseURL + "/.well-known/oauth-protected-resource"
-		slog.Info("OAuth 2.1 enabled for Claude (discovery at /.well-known/oauth-protected-resource)")
-	} else {
-		slog.Info("OAuth disabled (set PUBLIC_BASE_URL and OAUTH_PASSWORD to enable Claude); static Bearer only")
-	}
-
-	mux.Handle("/mcp", auth.Middleware(authCfg)(mcpHandler))
-
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-		// Bound the header read to blunt Slowloris-style slow-header attacks.
-		// ReadTimeout/WriteTimeout are intentionally left unset so long-lived
-		// Streamable-HTTP (SSE) responses are not cut off mid-stream.
+		Addr:              addr,
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
-		slog.Info("MoySklad MCP server listening", "addr", addr, "endpoint", "/mcp")
+		slog.Info("bot http server listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "err", err)
 			os.Exit(1)
 		}
 	}()
 
+	// Register the webhook only after the server is up, so Telegram's first
+	// delivery attempt doesn't hit a closed port. Idempotent on re-deploys.
+	webhookURL := publicBaseURL + "/tg/" + webhookSecret
+	if err := tg.SetWebhook(ctx, webhookURL, webhookSecret, []string{"message"}); err != nil {
+		slog.Error("setWebhook failed", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("telegram webhook registered", "url", publicBaseURL+"/tg/***")
+
+	workersDone := make(chan struct{})
+	go func() { bot.Run(ctx, webhook.Updates()); close(workersDone) }()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
 	slog.Info("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("graceful shutdown failed", "err", err)
+	}
+	cancel() // stop workers after the listener closed (no new updates)
+	<-workersDone
+}
+
+// runStdio serves the MoySklad MCP server over stdio — the standalone test
+// surface for the exact same mcpserver.New the bot's agent will dogfood.
+func runStdio() {
+	api, closeCache := buildAPI(requireEnv("MOYSKLAD_TOKEN"))
+	defer closeCache()
+
+	slog.Info("serving MoySklad MCP over stdio")
+	if err := server.ServeStdio(mcpserver.New(api)); err != nil {
+		slog.Error("stdio server error", "err", err)
+		os.Exit(1)
 	}
 }
 
