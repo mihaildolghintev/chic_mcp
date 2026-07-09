@@ -7,6 +7,8 @@ package cache
 
 import (
 	"database/sql"
+	"errors"
+	"log/slog"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,6 +19,9 @@ type Store struct {
 	db  *sql.DB
 	now func() time.Time
 }
+
+// The cache is best-effort: failures are logged, never propagated to callers.
+func (s *Store) log() *slog.Logger { return slog.Default() }
 
 const schema = `
 CREATE TABLE IF NOT EXISTS cache (
@@ -55,6 +60,10 @@ func (s *Store) Get(key string) ([]byte, bool) {
 		key, s.now().Unix(),
 	).Scan(&value)
 	if err != nil {
+		// A miss is the expected path; only a real query failure is worth logging.
+		if !errors.Is(err, sql.ErrNoRows) {
+			s.log().Warn("cache get failed", "err", err)
+		}
 		return nil, false
 	}
 	return value, true
@@ -66,17 +75,20 @@ func (s *Store) Set(key string, value []byte, ttl time.Duration) {
 		return
 	}
 	expires := s.now().Add(ttl).Unix()
-	_, _ = s.db.Exec(
+	if _, err := s.db.Exec(
 		`INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`,
 		key, value, expires,
-	)
+	); err != nil {
+		s.log().Warn("cache set failed", "err", err)
+	}
 }
 
 // Purge deletes expired entries and returns the number removed.
 func (s *Store) Purge() int64 {
 	res, err := s.db.Exec(`DELETE FROM cache WHERE expires_at <= ?`, s.now().Unix())
 	if err != nil {
+		s.log().Warn("cache purge failed", "err", err)
 		return 0
 	}
 	n, _ := res.RowsAffected()
@@ -95,7 +107,9 @@ func (s *Store) StartJanitor(every time.Duration) (stop func()) {
 			case <-done:
 				return
 			case <-t.C:
-				s.Purge()
+				if n := s.Purge(); n > 0 {
+					s.log().Debug("cache janitor purged expired entries", "count", n)
+				}
 			}
 		}
 	}()

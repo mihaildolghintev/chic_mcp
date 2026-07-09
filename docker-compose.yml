@@ -1,6 +1,9 @@
 services:
   mcp:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
     restart: unless-stopped
     environment:
       MCP_TRANSPORT: http

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,6 +35,7 @@ type Client struct {
 	sleep      func(context.Context, time.Duration) error
 	userAgent  string
 	pageLimit  int
+	logger     *slog.Logger
 }
 
 // Option configures a Client.
@@ -95,6 +97,16 @@ func WithSleeper(f func(context.Context, time.Duration) error) Option {
 	return func(c *Client) { c.sleep = f }
 }
 
+// WithLogger overrides the retry-diagnostics logger (default: slog.Default()).
+func WithLogger(l *slog.Logger) Option { return func(c *Client) { c.logger = l } }
+
+func (c *Client) log() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
+}
+
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
@@ -152,6 +164,7 @@ func (c *Client) doGet(ctx context.Context, path string, query url.Values) ([]by
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			c.log().Warn("moysklad request failed, retrying", "path", path, "attempt", attempt, "err", err)
 			if wErr := c.backoff(ctx, attempt, 0); wErr != nil {
 				return nil, wErr
 			}
@@ -162,6 +175,7 @@ func (c *Client) doGet(ctx context.Context, path string, query url.Values) ([]by
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = readErr
+			c.log().Warn("moysklad response read failed, retrying", "path", path, "attempt", attempt, "err", readErr)
 			if wErr := c.backoff(ctx, attempt, 0); wErr != nil {
 				return nil, wErr
 			}
@@ -176,6 +190,7 @@ func (c *Client) doGet(ctx context.Context, path string, query url.Values) ([]by
 			if attempt == c.maxRetries {
 				return nil, lastErr
 			}
+			c.log().Warn("moysklad rate limited, retrying", "path", path, "attempt", attempt)
 			if wErr := c.backoff(ctx, attempt, retryAfter(resp.Header)); wErr != nil {
 				return nil, wErr
 			}
@@ -185,6 +200,7 @@ func (c *Client) doGet(ctx context.Context, path string, query url.Values) ([]by
 			if attempt == c.maxRetries {
 				return nil, lastErr
 			}
+			c.log().Warn("moysklad server error, retrying", "path", path, "attempt", attempt, "status", resp.StatusCode)
 			if wErr := c.backoff(ctx, attempt, 0); wErr != nil {
 				return nil, wErr
 			}
