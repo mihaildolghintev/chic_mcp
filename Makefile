@@ -6,12 +6,17 @@ BIN_DIR := bin
 INSTALL_DIR := $(HOME)/.local/bin
 CACHE_DIR := $(HOME)/.moysklad-mcp
 
+# Version stamped into the binary (see internal/buildinfo). Falls back to "dev"
+# outside a git checkout. The git revision/time are embedded by the toolchain.
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X mcp.chic.md/internal/buildinfo.Version=$(VERSION)
+
 .PHONY: build install test fmt vet clean run-stdio run-http config
 
 ## build: compile a native static binary into ./bin
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/$(BINARY) ./cmd/server
-	@echo "built $(BIN_DIR)/$(BINARY) ($$(go env GOOS)/$$(go env GOARCH))"
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) ./cmd/server
+	@echo "built $(BIN_DIR)/$(BINARY) $(VERSION) ($$(go env GOOS)/$$(go env GOARCH))"
 
 ## install: build and copy the binary to ~/.local/bin
 install: build

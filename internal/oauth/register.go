@@ -44,6 +44,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Name:         req.ClientName,
 	})
 
+	s.log().Info("oauth client registered", "client_id", id, "name", req.ClientName)
+
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
 		"redirect_uris":              req.RedirectURIs,

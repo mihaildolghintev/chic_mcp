@@ -78,6 +78,7 @@ func (s *Server) authorizePOST(w http.ResponseWriter, r *http.Request) {
 
 	// Constant-time password check.
 	if subtle.ConstantTimeCompare([]byte(r.PostFormValue("password")), []byte(s.cfg.Password)) != 1 {
+		s.log().Warn("oauth login failed", "client_id", p.ClientID, "remote", r.RemoteAddr)
 		renderLogin(w, p, true)
 		return
 	}

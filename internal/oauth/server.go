@@ -8,6 +8,7 @@ package oauth
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -24,12 +25,15 @@ type Config struct {
 	CodeTTL time.Duration
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
+	// Logger receives auth events; nil uses slog.Default().
+	Logger *slog.Logger
 }
 
 // Server is the OAuth authorization server.
 type Server struct {
-	cfg   Config
-	store *store
+	cfg    Config
+	store  *store
+	logger *slog.Logger
 }
 
 // New builds a Server, applying defaults.
@@ -43,7 +47,14 @@ func New(cfg Config) *Server {
 	if cfg.CodeTTL == 0 {
 		cfg.CodeTTL = 5 * time.Minute
 	}
-	return &Server{cfg: cfg, store: newStore(cfg.Now)}
+	return &Server{cfg: cfg, store: newStore(cfg.Now), logger: cfg.Logger}
+}
+
+func (s *Server) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // Verify implements auth.Verifier: true iff token is a live access token.

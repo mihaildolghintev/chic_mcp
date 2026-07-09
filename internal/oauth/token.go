@@ -83,6 +83,8 @@ func (s *Server) issueTokens(w http.ResponseWriter, clientID, resource, scope st
 		Scope:    scope,
 	})
 
+	s.log().Info("oauth tokens issued", "client_id", clientID)
+
 	resp := map[string]any{
 		"access_token":  at,
 		"token_type":    "Bearer",
