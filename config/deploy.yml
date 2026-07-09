@@ -1,6 +1,6 @@
 # Kamal 2 deployment: one Go binary on the Hetzner box, fronted by
 # kamal-proxy which owns 80/443 and the Let's Encrypt certificate for
-# mcp.chic.md. Deploy with `kamal deploy` (first time: `kamal setup`).
+# bot.chic.md. Deploy with `kamal deploy` (first time: `kamal setup`).
 service: chic
 
 image: mihaildolghintev/chic
@@ -11,7 +11,7 @@ servers:
 
 proxy:
   ssl: true
-  host: mcp.chic.md
+  host: bot.chic.md
   app_port: 8080
   healthcheck:
     # The app serves /healthz (kamal-proxy's default probe path is /up).
@@ -35,7 +35,7 @@ builder:
 
 env:
   clear:
-    PUBLIC_BASE_URL: https://mcp.chic.md
+    PUBLIC_BASE_URL: https://bot.chic.md
     LISTEN_ADDR: ":8080"
     CACHE_DB: /data/cache.db
     LOG_FORMAT: json
