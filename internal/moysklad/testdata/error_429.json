@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "error": "Превышено количество запросов в единицу времени",
+      "code": 1049,
+      "moreInfo": "https://dev.moysklad.ru/doc/api/remap/1.2/#mojsklad-json-api-obschie-swedeniq-ogranicheniq"
+    }
+  ]
+}

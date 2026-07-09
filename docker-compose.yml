@@ -1,0 +1,44 @@
+services:
+  mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      MCP_TRANSPORT: http
+      MOYSKLAD_TOKEN: ${MOYSKLAD_TOKEN:?set MOYSKLAD_TOKEN in .env}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?set MCP_BEARER_TOKEN in .env}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://mcp.chic.md}
+      OAUTH_PASSWORD: ${OAUTH_PASSWORD:?set OAUTH_PASSWORD in .env}
+      CACHE_DB: /app/data/cache.db
+      LISTEN_ADDR: ":8080"
+    volumes:
+      # Persistent SQLite cache (populated by the cache layer, WIP).
+      - mcp-data:/app/data
+    # Not published to the host: Caddy reverse-proxies to it over the compose
+    # network. Expose to Caddy only.
+    expose:
+      - "8080"
+    networks:
+      - web
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - web
+    depends_on:
+      - mcp
+
+volumes:
+  mcp-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  web:

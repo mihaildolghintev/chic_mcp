@@ -1,0 +1,18 @@
+# Binaries
+/server
+/bin/
+/out/
+*.exe
+
+# Local env / secrets
+.env
+*.local
+
+# SQLite cache
+*.db
+*.db-shm
+*.db-wal
+/data/
+
+# OS / editor
+.DS_Store

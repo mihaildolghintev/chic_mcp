@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+*.md
+Dockerfile
+docker-compose.yml
+Caddyfile
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
