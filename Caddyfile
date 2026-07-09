@@ -1,4 +1,0 @@
-mcp.chic.md {
-	# Caddy fetches and renews the Let's Encrypt cert automatically.
-	reverse_proxy mcp:8080
-}

@@ -1,9 +1,14 @@
+# One service on the shared `edge` network. The edge proxy (caddy-docker-proxy)
+# lives in the separate infra repo; it terminates TLS for every app on the box
+# and routes to this container by the `caddy.*` labels below — no central
+# Caddyfile to edit when apps come and go.
+#
+# The image is built and pushed to GHCR by CI; the server only pulls it.
+# Deploy = `docker compose pull && docker compose up -d` (done by the deploy
+# workflow over SSH).
 services:
   mcp:
-    build:
-      context: .
-      args:
-        VERSION: ${VERSION:-dev}
+    image: ghcr.io/mihaildolghintev/chic_mcp:${TAG:-latest}
     restart: unless-stopped
     environment:
       MCP_TRANSPORT: http
@@ -14,34 +19,25 @@ services:
       CACHE_DB: /app/data/cache.db
       LISTEN_ADDR: ":8080"
     volumes:
-      # Persistent SQLite cache (populated by the cache layer, WIP).
+      # Persistent SQLite response cache (survives restarts).
       - mcp-data:/app/data
-    # Not published to the host: Caddy reverse-proxies to it over the compose
-    # network. Expose to Caddy only.
-    expose:
-      - "8080"
     networks:
-      - web
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    networks:
-      - web
-    depends_on:
-      - mcp
+      - edge
+    # caddy-docker-proxy reads these: serve mcp.chic.md and reverse-proxy it to
+    # this container's :8080. TLS (Let's Encrypt) is automatic. The port is the
+    # container's internal port on the edge network — nothing is published to
+    # the host.
+    labels:
+      caddy: mcp.chic.md
+      caddy.reverse_proxy: "{{upstreams 8080}}"
 
 volumes:
   mcp-data:
-  caddy-data:
-  caddy-config:
 
+# Created once on the server (`docker network create edge`) and shared by the
+# edge proxy and every app. Internal service-to-service calls (e.g. a Telegram
+# backend hitting http://mcp:8080/mcp) stay on this network, off the public net.
 networks:
-  web:
+  edge:
+    external: true
+    name: edge
