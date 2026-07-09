@@ -9,8 +9,10 @@ import (
 )
 
 // secretTokenHeader is the header Telegram echoes back on every webhook
-// delivery when a secret_token was passed to setWebhook.
-const secretTokenHeader = "X-Telegram-Bot-Api-Secret-Token"
+// delivery when a secret_token was passed to setWebhook. It is the header
+// NAME, not a credential — the value is compared against the env-provided
+// secret at request time.
+const secretTokenHeader = "X-Telegram-Bot-Api-Secret-Token" // #nosec G101 -- header name, not a credential
 
 // Webhook is the HTTP receiver for Telegram updates. It verifies the secret
 // token, deduplicates by update_id and hands updates to a buffered queue —
