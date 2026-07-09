@@ -11,7 +11,7 @@ CACHE_DIR := $(HOME)/.moysklad-mcp
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X mcp.chic.md/internal/buildinfo.Version=$(VERSION)
 
-.PHONY: build install test fmt vet clean run-stdio run-http config
+.PHONY: build install test fmt vet clean run-stdio run-bot config
 
 ## build: compile a native static binary into ./bin
 build:
@@ -43,12 +43,14 @@ run-stdio: build
 	CACHE_DB=$(CACHE_DIR)/cache.db \
 	$(BIN_DIR)/$(BINARY) -transport stdio
 
-## run-http: run a local HTTP server on :8080 (needs MOYSKLAD_TOKEN, MCP_BEARER_TOKEN)
-run-http: build
-	MOYSKLAD_TOKEN=$${MOYSKLAD_TOKEN:?set MOYSKLAD_TOKEN} \
-	MCP_BEARER_TOKEN=$${MCP_BEARER_TOKEN:?set MCP_BEARER_TOKEN} \
-	CACHE_DB=$(CACHE_DIR)/cache.db \
-	$(BIN_DIR)/$(BINARY) -transport http
+## run-bot: run the Telegram bot locally on :8080 (pair with a cloudflared
+## tunnel; PUBLIC_BASE_URL must be the tunnel's https URL)
+run-bot: build
+	TELEGRAM_BOT_TOKEN=$${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN} \
+	TELEGRAM_WEBHOOK_SECRET=$${TELEGRAM_WEBHOOK_SECRET:?set TELEGRAM_WEBHOOK_SECRET} \
+	ALLOWED_USER_IDS=$${ALLOWED_USER_IDS:?set ALLOWED_USER_IDS} \
+	PUBLIC_BASE_URL=$${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the tunnel url} \
+	$(BIN_DIR)/$(BINARY)
 
 ## config: print a ready-to-paste Claude Desktop connector config
 config: install

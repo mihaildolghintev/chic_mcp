@@ -1,0 +1,54 @@
+# Kamal 2 deployment: one Go binary on the Hetzner box, fronted by
+# kamal-proxy which owns 80/443 and the Let's Encrypt certificate for
+# mcp.chic.md. Deploy with `kamal deploy` (first time: `kamal setup`).
+service: chic
+
+image: mihaildolghintev/chic
+
+servers:
+  web:
+    - 204.168.131.104
+
+proxy:
+  ssl: true
+  host: mcp.chic.md
+  app_port: 8080
+  healthcheck:
+    # The app serves /healthz (kamal-proxy's default probe path is /up).
+    path: /healthz
+
+registry:
+  server: ghcr.io
+  username: mihaildolghintev
+  # GitHub PAT with read:packages + write:packages. Kamal pushes from the
+  # laptop and logs the server in with the same credential, so the GHCR
+  # package can stay private.
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  # The box is x86; the laptop is Apple Silicon. Cross-build only the target
+  # arch (pure-Go binary, so no CGO cross-compilation pain).
+  arch: amd64
+  args:
+    VERSION: <%= `git describe --tags --always`.strip %>
+
+env:
+  clear:
+    PUBLIC_BASE_URL: https://mcp.chic.md
+    LISTEN_ADDR: ":8080"
+    CACHE_DB: /data/cache.db
+    LOG_FORMAT: json
+  secret:
+    - TELEGRAM_BOT_TOKEN
+    - TELEGRAM_WEBHOOK_SECRET
+    - ALLOWED_USER_IDS
+    - MOYSKLAD_TOKEN
+
+# Persistent SQLite files (response cache now; app.db with conversation
+# history in the next milestone) survive deploys on a named volume.
+volumes:
+  - "chic_data:/data"
+
+ssh:
+  user: deploy
