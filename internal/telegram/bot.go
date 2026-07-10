@@ -44,16 +44,34 @@ func Echo() Handler {
 	})
 }
 
+// The "new session" affordance: a /new command in the bot menu and an inline
+// button under every answer, both resetting the agent's dialog memory so the
+// next question starts from a clean slate.
+const (
+	callbackNewSession = "new_session"
+	// MsgSessionReset confirms a session reset; exported so the /new command
+	// handler in main answers with the same wording as the button.
+	MsgSessionReset = "🆕 Начали заново — прошлый диалог больше не учитывается."
+	msgResetFailed  = "Не получилось сбросить контекст, попробуйте ещё раз."
+)
+
+var newSessionKeyboard = &models.InlineKeyboardMarkup{
+	InlineKeyboard: [][]models.InlineKeyboardButton{
+		{{Text: "🆕 Новый диалог", CallbackData: callbackNewSession}},
+	},
+}
+
 // Bot is the go-telegram/bot instance plus chic's policy layer. It answers
 // rejected users with a fixed refusal so the bot doesn't look dead to a
 // stranger (there are only two allowed users).
 type Bot struct {
-	api     *bot.Bot
-	secret  string
-	allowed map[int64]struct{}
-	handler Handler
-	seen    *dedupe
-	logger  *slog.Logger
+	api          *bot.Bot
+	secret       string
+	allowed      map[int64]struct{}
+	handler      Handler
+	onNewSession func(ctx context.Context, chatID int64) error
+	seen         *dedupe
+	logger       *slog.Logger
 }
 
 // New builds the bot. It calls getMe under the hood, so a bad token fails
@@ -97,6 +115,10 @@ func New(token, webhookSecret string, allowed map[int64]struct{}, handler Handle
 // wrap (SendPhoto, SendDocument, inline keyboards, ...).
 func (b *Bot) API() *bot.Bot { return b.api }
 
+// OnNewSession installs the reset hook the "new dialog" button and /new
+// command trigger. Must be called before StartWebhook.
+func (b *Bot) OnNewSession(f func(ctx context.Context, chatID int64) error) { b.onNewSession = f }
+
 // Me returns the bot's own account (startup logging).
 func (b *Bot) Me(ctx context.Context) (*models.User, error) {
 	return b.api.GetMe(ctx)
@@ -109,36 +131,49 @@ func (b *Bot) WebhookHandler() http.Handler { return b.api.WebhookHandler() }
 // StartWebhook runs the worker pool until ctx is cancelled.
 func (b *Bot) StartWebhook(ctx context.Context) { b.api.StartWebhook(ctx) }
 
-// RegisterWebhook points Telegram at url, subscribing to message updates
-// only. Telegram echoes the secret token back on every delivery, which the
-// webhook handler verifies. Re-registering the same URL is idempotent.
+// RegisterWebhook points Telegram at url, subscribing to messages and
+// inline-button presses. Telegram echoes the secret token back on every
+// delivery, which the webhook handler verifies. It also (re)publishes the
+// bot's command menu. Re-registering the same URL is idempotent.
 func (b *Bot) RegisterWebhook(ctx context.Context, url string) error {
-	_, err := b.api.SetWebhook(ctx, &bot.SetWebhookParams{
+	if _, err := b.api.SetWebhook(ctx, &bot.SetWebhookParams{
 		URL:            url,
 		SecretToken:    b.secret,
-		AllowedUpdates: []string{"message"},
+		AllowedUpdates: []string{"message", "callback_query"},
+	}); err != nil {
+		return err
+	}
+	_, err := b.api.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		Commands: []models.BotCommand{
+			{Command: "new", Description: "Новый диалог — забыть контекст"},
+		},
 	})
 	return err
 }
 
 // onUpdate handles one update end to end; errors are logged, never fatal.
 func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
-	msg := u.Message
-	if msg == nil || msg.From == nil {
-		return // not a message update (subscribed to messages only, but be safe)
-	}
-	log := b.logger.With("update_id", u.ID, "user_id", msg.From.ID, "chat_id", msg.Chat.ID)
-
 	// Telegram re-delivers an update if it doubts our 200 reached it, and
 	// processing one twice would double-reply. The library doesn't dedupe.
 	if !b.seen.firstSeen(u.ID) {
-		log.Debug("duplicate update dropped")
+		b.logger.Debug("duplicate update dropped", "update_id", u.ID)
 		return
 	}
 
+	if u.CallbackQuery != nil {
+		b.onCallback(ctx, u.CallbackQuery)
+		return
+	}
+
+	msg := u.Message
+	if msg == nil || msg.From == nil {
+		return // not an update we subscribed to, but be safe
+	}
+	log := b.logger.With("update_id", u.ID, "user_id", msg.From.ID, "chat_id", msg.Chat.ID)
+
 	if _, ok := b.allowed[msg.From.ID]; !ok {
 		log.Warn("message from user not in allowlist")
-		b.reply(ctx, log, msg.Chat.ID, "Извините, этот бот приватный.")
+		b.reply(ctx, log, msg.Chat.ID, "Извините, этот бот приватный.", false)
 		return
 	}
 
@@ -149,13 +184,43 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	stopTyping()
 	if err != nil {
 		log.Error("handler failed", "err", err)
-		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.")
+		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", false)
 		return
 	}
 	if text == "" {
 		return
 	}
-	b.reply(ctx, log, msg.Chat.ID, text)
+	b.reply(ctx, log, msg.Chat.ID, text, true)
+}
+
+// onCallback handles an inline-button press. The only button today is
+// "new dialog", which resets the agent's memory for the chat.
+func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
+	log := b.logger.With("callback_id", q.ID, "user_id", q.From.ID)
+	// Always ack, even on the ignore paths — otherwise the client spins.
+	defer func() {
+		if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
+			log.Debug("answerCallbackQuery failed", "err", err)
+		}
+	}()
+
+	if _, ok := b.allowed[q.From.ID]; !ok {
+		log.Warn("callback from user not in allowlist")
+		return
+	}
+	// Message can be inaccessible when the button is older than 48h — then
+	// there is no chat to answer in, so drop the press.
+	if q.Data != callbackNewSession || q.Message.Message == nil || b.onNewSession == nil {
+		return
+	}
+	chatID := q.Message.Message.Chat.ID
+	if err := b.onNewSession(ctx, chatID); err != nil {
+		log.Error("new session reset failed", "err", err)
+		b.reply(ctx, log, chatID, msgResetFailed, false)
+		return
+	}
+	log.Info("new session started", "chat_id", chatID)
+	b.reply(ctx, log, chatID, MsgSessionReset, false)
 }
 
 // maxMessageLen is Telegram's hard cap on sendMessage text.
@@ -165,17 +230,28 @@ const maxMessageLen = 4096
 // agent is prompted to emit HTML, but the sanitizer is what guarantees it
 // parses), split into limit-sized chunks with tags balanced per chunk, and if
 // Telegram still rejects a chunk with 400 it is resent as plain text — a
-// degraded answer beats a swallowed one.
-func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string) {
-	for _, chunk := range splitHTML(sanitizeHTML(text), maxMessageLen) {
+// degraded answer beats a swallowed one. withKeyboard hangs the "new dialog"
+// button under the last chunk — answers get it, service notices don't.
+func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string, withKeyboard bool) {
+	chunks := splitHTML(sanitizeHTML(normalizeMarkdown(text)), maxMessageLen)
+	for i, chunk := range chunks {
+		var markup models.ReplyMarkup
+		if withKeyboard && i == len(chunks)-1 {
+			markup = newSessionKeyboard
+		}
 		_, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID:    chatID,
-			Text:      chunk,
-			ParseMode: models.ParseModeHTML,
+			ChatID:      chatID,
+			Text:        chunk,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: markup,
 		})
 		if err != nil && errors.Is(err, bot.ErrorBadRequest) {
 			log.Warn("HTML reply rejected, resending as plain text", "err", err)
-			_, err = b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: stripTags(chunk)})
+			_, err = b.api.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID:      chatID,
+				Text:        stripTags(chunk),
+				ReplyMarkup: markup,
+			})
 		}
 		if err != nil {
 			log.Error("sendMessage failed", "err", err)

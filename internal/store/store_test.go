@@ -61,6 +61,51 @@ func TestRecentMessages_EmptyChat(t *testing.T) {
 	}
 }
 
+// TestStartSessionHidesOlderMessages: after a session boundary the replayed
+// history starts from a clean slate, per chat, without deleting anything.
+func TestStartSessionHidesOlderMessages(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.AppendMessage(ctx, 42, "user", "старый вопрос"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AppendMessage(ctx, 7, "user", "чужой чат"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StartSession(ctx, 42); err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+
+	got, err := d.RecentMessages(ctx, 42, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("after reset chat 42 sees %+v, want nothing", got)
+	}
+
+	if err := d.AppendMessage(ctx, 42, "user", "новый вопрос"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.RecentMessages(ctx, 42, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Content != "новый вопрос" {
+		t.Errorf("after reset chat 42 sees %+v, want only the new message", got)
+	}
+
+	// The boundary is per chat: chat 7 still remembers.
+	got, err = d.RecentMessages(ctx, 7, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Content != "чужой чат" {
+		t.Errorf("chat 7 sees %+v, want its message intact", got)
+	}
+}
+
 func TestChatsAreIsolated(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()

@@ -26,6 +26,38 @@ var (
 	anyTagRe = regexp.MustCompile(`<(/?)([a-z-]+)(?: [^<>]*)?>`)
 )
 
+var (
+	// Markdown the LLM slips into despite the prompt (and keeps imitating
+	// from pre-HTML replies in the dialog history): **bold**, ### headings
+	// and | tables |. Telegram renders none of it, so normalizeMarkdown
+	// rewrites these into HTML/plain lines before sanitizing.
+	mdBoldRe     = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
+	mdHeadingRe  = regexp.MustCompile(`(?m)^#{1,6} +([^\n]+?)[ #]*$`)
+	mdTableSepRe = regexp.MustCompile(`(?m)^ *\|?[ \t:|-]*-[ \t:|-]*\|? *$\n?`)
+	mdTableRowRe = regexp.MustCompile(`(?m)^ *\|(.+)\| *$`)
+)
+
+// normalizeMarkdown converts the markdown constructs Telegram can't render
+// into their closest Telegram-HTML shape: bold and headings become <b>, a
+// table row becomes one plain line with " — " between cells, separator rows
+// disappear. Everything else passes through for sanitizeHTML to handle.
+func normalizeMarkdown(s string) string {
+	s = mdTableSepRe.ReplaceAllString(s, "")
+	s = mdTableRowRe.ReplaceAllStringFunc(s, func(row string) string {
+		cells := strings.Split(strings.Trim(strings.TrimSpace(row), "|"), "|")
+		kept := make([]string, 0, len(cells))
+		for _, c := range cells {
+			if c = strings.TrimSpace(c); c != "" {
+				kept = append(kept, c)
+			}
+		}
+		return strings.Join(kept, " — ")
+	})
+	s = mdHeadingRe.ReplaceAllString(s, "<b>$1</b>")
+	s = mdBoldRe.ReplaceAllString(s, "<b>$1</b>")
+	return s
+}
+
 // openTag remembers an open tag: the literal token (to reopen it in the next
 // message chunk) and the bare name (to synthesize its closing tag).
 type openTag struct {

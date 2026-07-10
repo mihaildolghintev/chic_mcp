@@ -30,9 +30,10 @@ type fakeAPI struct {
 }
 
 type sentMessage struct {
-	ChatID    int64  `json:"chat_id"`
-	Text      string `json:"text"`
-	ParseMode string `json:"parse_mode"`
+	ChatID      int64  `json:"chat_id"`
+	Text        string `json:"text"`
+	ParseMode   string `json:"parse_mode"`
+	ReplyMarkup string `json:"reply_markup"`
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -50,7 +51,12 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 			if err != nil {
 				t.Errorf("sendMessage chat_id: %v", err)
 			}
-			m := sentMessage{ChatID: chatID, Text: r.FormValue("text"), ParseMode: r.FormValue("parse_mode")}
+			m := sentMessage{
+				ChatID:      chatID,
+				Text:        r.FormValue("text"),
+				ParseMode:   r.FormValue("parse_mode"),
+				ReplyMarkup: r.FormValue("reply_markup"),
+			}
 			f.mu.Lock()
 			f.sent = append(f.sent, m)
 			f.mu.Unlock()
@@ -64,7 +70,9 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 				return
 			}
 			result = map[string]any{"message_id": 1, "date": 0, "chat": map[string]any{"id": m.ChatID}}
-		case strings.HasSuffix(r.URL.Path, "/setWebhook"):
+		case strings.HasSuffix(r.URL.Path, "/setWebhook"),
+			strings.HasSuffix(r.URL.Path, "/setMyCommands"),
+			strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
 			result = true
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -157,6 +165,85 @@ func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
 	}
 	if sent[1].ParseMode != "" || sent[1].Text != "жирный текст" {
 		t.Errorf("retry must be plain text without tags, got %+v", sent[1])
+	}
+}
+
+// TestReplyCarriesNewSessionButton: handler answers get the inline "new
+// dialog" button; service notices (like the refusal) don't.
+func TestReplyCarriesNewSessionButton(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, Echo())
+
+	process(b, update(1, 100, "привет"))
+	process(b, update(2, 999, "пусти"))
+
+	sent := f.sentMessages()
+	if len(sent) != 2 {
+		t.Fatalf("want 2 messages, got %+v", sent)
+	}
+	if !strings.Contains(sent[0].ReplyMarkup, callbackNewSession) {
+		t.Errorf("answer must carry the new-session button, got %+v", sent[0])
+	}
+	if sent[1].ReplyMarkup != "" {
+		t.Errorf("refusal must not carry a keyboard, got %+v", sent[1])
+	}
+}
+
+func callbackUpdate(id, userID, chatID int64, data string) *models.Update {
+	return &models.Update{
+		ID: id,
+		CallbackQuery: &models.CallbackQuery{
+			ID:   strconv.FormatInt(id, 10),
+			From: models.User{ID: userID},
+			Data: data,
+			Message: models.MaybeInaccessibleMessage{
+				Type:    models.MaybeInaccessibleMessageTypeMessage,
+				Message: &models.Message{Chat: models.Chat{ID: chatID}},
+			},
+		},
+	}
+}
+
+// TestNewSessionCallbackResetsAndConfirms: a button press from an allowed
+// user fires the reset hook and answers with the confirmation.
+func TestNewSessionCallbackResetsAndConfirms(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, Echo())
+	var resetChat int64
+	b.OnNewSession(func(_ context.Context, chatID int64) error {
+		resetChat = chatID
+		return nil
+	})
+
+	process(b, callbackUpdate(1, 100, 100, callbackNewSession))
+
+	if resetChat != 100 {
+		t.Errorf("reset hook got chat %d, want 100", resetChat)
+	}
+	sent := f.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "Начали заново") {
+		t.Fatalf("want reset confirmation, got %+v", sent)
+	}
+	if sent[0].ReplyMarkup != "" {
+		t.Errorf("confirmation must not carry a keyboard, got %+v", sent[0])
+	}
+}
+
+// TestNewSessionCallbackFromStrangerIgnored: allowlist applies to button
+// presses too — no reset, no reply.
+func TestNewSessionCallbackFromStrangerIgnored(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, Echo())
+	reset := false
+	b.OnNewSession(func(context.Context, int64) error { reset = true; return nil })
+
+	process(b, callbackUpdate(1, 999, 999, callbackNewSession))
+
+	if reset {
+		t.Error("stranger's callback must not reset a session")
+	}
+	if sent := f.sentMessages(); len(sent) != 0 {
+		t.Fatalf("want no replies, got %+v", sent)
 	}
 }
 
