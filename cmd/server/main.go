@@ -166,6 +166,13 @@ func runBot() {
 	// right below, before any update is served.
 	var bot *telegram.Bot
 	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (string, error) {
+		// /new works the same as the inline button: forget the dialog.
+		if cmd, _, _ := strings.Cut(strings.TrimSpace(msg.Text), "@"); cmd == "/new" {
+			if err := ag.Reset(ctx, msg.Chat.ID); err != nil {
+				return "", fmt.Errorf("reset session: %w", err)
+			}
+			return telegram.MsgSessionReset, nil
+		}
 		text, imageURI := msg.Text, ""
 		if len(msg.Photo) > 0 {
 			uri, err := bot.PhotoDataURI(ctx, msg)
@@ -190,6 +197,7 @@ func runBot() {
 		slog.Error("telegram init failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
 		os.Exit(1)
 	}
+	bot.OnNewSession(ag.Reset)
 
 	me, err := bot.Me(ctx)
 	if err != nil {

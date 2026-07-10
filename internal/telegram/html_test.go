@@ -35,6 +35,26 @@ func TestSanitizeHTML(t *testing.T) {
 	}
 }
 
+func TestNormalizeMarkdown(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"bold", "скидка **50%** срочно", "скидка <b>50%</b> срочно"},
+		{"heading", "### 🔴 КАТЕГОРИЯ 1 — Аварийная", "<b>🔴 КАТЕГОРИЯ 1 — Аварийная</b>"},
+		{"table to lines", "| Товар | Остаток |\n|-------:|:-----|\n| **Rimel 9ml** | 12 шт |", "Товар — Остаток\n<b>Rimel 9ml</b> — 12 шт"},
+		{"hr dropped", "итог\n---\nдетали", "итог\nдетали"},
+		{"list dash kept", "- пункт раз\n- пункт два", "- пункт раз\n- пункт два"},
+		{"plain text untouched", "обычный ответ: 12 345 ₽", "обычный ответ: 12 345 ₽"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeMarkdown(tc.in); got != tc.want {
+				t.Errorf("normalizeMarkdown(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStripTags(t *testing.T) {
 	in := `📦 <b>Товар</b>: 1 &lt; 2 &amp; <a href="https://x">ссылка</a>`
 	want := "📦 Товар: 1 < 2 & ссылка"

@@ -25,6 +25,7 @@ type Message struct {
 type Store interface {
 	AppendMessage(ctx context.Context, chatID int64, role, content string) error
 	RecentMessages(ctx context.Context, chatID int64, n int) ([]Message, error)
+	StartSession(ctx context.Context, chatID int64) error
 }
 
 // DB is the SQLite-backed Store. Writes go through a dedicated single-connection
@@ -97,17 +98,36 @@ func (d *DB) AppendMessage(ctx context.Context, chatID int64, role, content stri
 	return nil
 }
 
-// RecentMessages returns the last n messages for chatID in chronological
-// order — ready to be prepended to an LLM conversation.
+// StartSession draws a session boundary for chatID: RecentMessages stops
+// replaying anything said before it. Old rows stay in the table — app.db is
+// the system of record — only the agent's working memory is reset.
+func (d *DB) StartSession(ctx context.Context, chatID int64) error {
+	_, err := d.write.ExecContext(ctx,
+		`INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'reset', '', ?)`,
+		chatID, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("store: start session: %w", err)
+	}
+	return nil
+}
+
+// RecentMessages returns the last n messages of the current session for
+// chatID in chronological order — ready to be prepended to an LLM
+// conversation. Messages before the last session boundary (and the boundary
+// rows themselves) are never returned.
 func (d *DB) RecentMessages(ctx context.Context, chatID int64, n int) ([]Message, error) {
 	if n <= 0 {
 		return nil, nil
 	}
 	rows, err := d.read.QueryContext(ctx,
 		`SELECT role, content FROM (
-			SELECT id, role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?
+			SELECT id, role, content FROM messages
+			WHERE chat_id = ?
+			  AND id > COALESCE((SELECT MAX(id) FROM messages WHERE chat_id = ? AND role = 'reset'), 0)
+			ORDER BY id DESC LIMIT ?
 		) ORDER BY id ASC`,
-		chatID, n,
+		chatID, chatID, n,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: recent messages: %w", err)

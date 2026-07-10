@@ -113,6 +113,12 @@ func New(ctx context.Context, llmClient *llm.Client, srv *server.MCPServer, st s
 // Close tears down the MCP session.
 func (a *Agent) Close() error { return a.mcp.Close() }
 
+// Reset starts a fresh dialog session for chatID: the next answer won't see
+// anything said before this point. Old messages stay stored.
+func (a *Agent) Reset(ctx context.Context, chatID int64) error {
+	return a.store.StartSession(ctx, chatID)
+}
+
 // convertTools turns MCP tool schemas into OpenAI function definitions — the
 // schemas are already JSON Schema objects, so this is a rename, not a mapping.
 func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
@@ -302,6 +308,8 @@ func systemPrompt(now time.Time) string {
 Формат: ответ уходит в Telegram с ParseMode=HTML.
 - Разрешены ТОЛЬКО теги <b>, <i>, <code>, <pre> и <blockquote expandable>.
   Markdown (**, ###, |---|) и другие теги Telegram не отображает — не используй их.
+- ВАЖНО: если прошлые ответы в истории диалога отформатированы markdown'ом
+  (**, ###, | таблицы |) — это старый формат, НЕ повторяй его стиль.
 - Символы <, > и & в обычном тексте пиши как &lt;, &gt;, &amp;.
 - Таблиц и заголовков в Telegram нет. Вместо таблицы — карточки: строка
   «эмодзи <b>Название</b>», под ней 1-3 короткие строки «показатель: значение»,
