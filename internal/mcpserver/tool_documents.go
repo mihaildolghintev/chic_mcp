@@ -18,12 +18,17 @@ func init() {
 
 const docTypesHelp = "One of: demand (sale), customerorder, supply (purchase), " +
 	"purchaseorder, invoiceout (customer invoice), invoicein, salesreturn, " +
-	"purchasereturn, paymentin, paymentout."
+	"purchasereturn, paymentin, paymentout, move (warehouse transfer), " +
+	"inventory (stock count), loss (write-off), enter (stock-in), processing."
+
+// docTypeEnum is the JSON-schema enum, derived from the client's single source
+// of truth so it can never drift from ValidDocumentType.
+var docTypeEnum = moysklad.DocumentTypeStrings()
 
 // ---- search_documents -----------------------------------------------------
 
 func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("search_documents",
+	tool := newTool("search_documents",
 		mcp.WithDescription(
 			"Search MoySklad documents of a given type in a date range, optionally by "+
 				"counterparty or free text. Returns a `totals` object (sum and paid over "+
@@ -35,7 +40,7 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 				"sum includes services and does not subtract returns, so it can differ from "+
 				"get_profit revenue. Amounts are in the account's base currency.",
 		),
-		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp)),
+		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp), mcp.Enum(docTypeEnum...)),
 		mcp.WithString("date_from", mcp.Description("Filter moment >= this date, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Filter moment <= this date, YYYY-MM-DD. Optional.")),
 		mcp.WithString("counterparty_id", mcp.Description("Filter by counterparty UUID. Optional.")),
@@ -57,6 +62,12 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 			Search:         req.GetString("search", ""),
 			Order:          "moment,desc",
 		}
+		// Expand the currency so non-base-currency documents are labelled with
+		// their ISO code instead of being silently read as base — but only for
+		// document types that actually have a currency (warehouse ops reject it).
+		if moysklad.HasCurrency(moysklad.DocumentType(docType)) {
+			q.Expand = []string{"rate.currency"}
+		}
 		docs, err := api.SearchDocuments(ctx, moysklad.DocumentType(docType), q)
 		if err != nil {
 			return resultOrError[any](nil, err)
@@ -68,12 +79,12 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_document ---------------------------------------------------------
 
 func registerGetDocument(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_document",
+	tool := newTool("get_document",
 		mcp.WithDescription(
 			"Fetch one document by type and id with its line items (positions): "+
 				"product, quantity, price, discount, total. Amounts are in the account's base currency.",
 		),
-		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp)),
+		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp), mcp.Enum(docTypeEnum...)),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Document UUID.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -85,8 +96,11 @@ func registerGetDocument(s *server.MCPServer, api MoyskladAPI) {
 		if err != nil {
 			return mcp.NewToolResultError("id is required"), nil
 		}
-		doc, err := api.GetDocument(ctx, moysklad.DocumentType(docType), id,
-			[]string{"positions.assortment", "agent", "state", "store"})
+		expand := []string{"positions.assortment", "agent", "state", "store"}
+		if moysklad.HasCurrency(moysklad.DocumentType(docType)) {
+			expand = append(expand, "rate.currency")
+		}
+		doc, err := api.GetDocument(ctx, moysklad.DocumentType(docType), id, expand)
 		if err != nil {
 			return resultOrError[any](nil, err)
 		}
@@ -97,7 +111,7 @@ func registerGetDocument(s *server.MCPServer, api MoyskladAPI) {
 // ---- search_counterparty --------------------------------------------------
 
 func registerSearchCounterparty(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("search_counterparty",
+	tool := newTool("search_counterparty",
 		mcp.WithDescription(
 			"Find counterparties (customers/suppliers) by name, INN, phone or email. "+
 				"Returns id, name, type, INN, contacts — use the id to filter documents "+

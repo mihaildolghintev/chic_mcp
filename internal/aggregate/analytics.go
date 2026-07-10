@@ -92,6 +92,40 @@ func ABC[T any](items []T, value func(T) float64, aCut, bCut float64) []ABCItem[
 	return res
 }
 
+// ABCTotals summarises an ABC run over every item, so the detail list can be
+// truncated without losing the class breakdown.
+type ABCTotals struct {
+	Count  int     `json:"count"`  // items classified in total
+	Value  float64 `json:"value"`  // sum of positive metric values
+	ACount int     `json:"aCount"` // items in class A
+	BCount int     `json:"bCount"` // items in class B
+	CCount int     `json:"cCount"` // items in class C (long tail)
+}
+
+// ABCReport wraps a classified item list in the standard truncating envelope:
+// totals (including per-class counts) cover EVERY item, while Rows carries only
+// the top `limit` by value — the C-class long tail is exactly what a caller
+// does not need enumerated. Items must already be sorted by value desc (ABC is).
+func ABCReport[T any](items []ABCItem[T], limit int) Report[ABCItem[T], ABCTotals] {
+	var t ABCTotals
+	t.Count = len(items)
+	for _, it := range items {
+		if it.Value > 0 {
+			t.Value += it.Value
+		}
+		switch it.Class {
+		case ClassA:
+			t.ACount++
+		case ClassB:
+			t.BCount++
+		default:
+			t.CCount++
+		}
+	}
+	t.Value = round2(t.Value)
+	return newReport(items, t, limit)
+}
+
 // ---- Counterparty segmentation (RFM-style rules) --------------------------
 
 // SegmentParams configures the segmentation rules. Zero fields fall back to
@@ -194,6 +228,46 @@ func SegmentCounterparties(rows []moysklad.CounterpartyRow, p SegmentParams) []C
 	return out
 }
 
+// SegmentTotals counts how many counterparties carry each label, so a truncated
+// detail list still conveys the shape of the customer base.
+type SegmentTotals struct {
+	Count          int `json:"count"`
+	Vip            int `json:"vip"`
+	Sleeping       int `json:"sleeping"`
+	AtRisk         int `json:"atRisk"`
+	LowCheck       int `json:"lowCheck"`
+	Debtor         int `json:"debtor"`
+	NegativeMargin int `json:"negativeMargin"`
+}
+
+// SegmentReport tallies label counts over EVERY counterparty, sorts by revenue
+// desc, and truncates the detail list to limit so a big customer base cannot
+// blow up the response.
+func SegmentReport(segs []CounterpartySegment, limit int) Report[CounterpartySegment, SegmentTotals] {
+	var t SegmentTotals
+	t.Count = len(segs)
+	for _, s := range segs {
+		for _, lbl := range s.Segments {
+			switch lbl {
+			case "vip":
+				t.Vip++
+			case "sleeping":
+				t.Sleeping++
+			case "at_risk":
+				t.AtRisk++
+			case "low_check":
+				t.LowCheck++
+			case "debtor":
+				t.Debtor++
+			case "negative_margin":
+				t.NegativeMargin++
+			}
+		}
+	}
+	sort.SliceStable(segs, func(i, j int) bool { return segs[i].Revenue > segs[j].Revenue })
+	return newReport(segs, t, limit)
+}
+
 // ---- Dead stock -----------------------------------------------------------
 
 // DeadStockLine is a stock line flagged as dead: on hand for at least the
@@ -228,6 +302,25 @@ func DeadStock(rows []moysklad.StockRow, outcomeByRef map[string]float64, thresh
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].StockValue > out[j].StockValue })
 	return out
+}
+
+// DeadStockTotals is the answer to "how much money is frozen", over every dead
+// item, so the detail list can be truncated safely.
+type DeadStockTotals struct {
+	Count      int     `json:"count"`
+	StockValue float64 `json:"stockValue"`
+}
+
+// DeadStockReport totals tied-up value across all dead items and truncates the
+// detail list (already sorted by value desc) to limit.
+func DeadStockReport(lines []DeadStockLine, limit int) Report[DeadStockLine, DeadStockTotals] {
+	var t DeadStockTotals
+	t.Count = len(lines)
+	for _, l := range lines {
+		t.StockValue += l.StockValue
+	}
+	t.StockValue = round2(t.StockValue)
+	return newReport(lines, t, limit)
 }
 
 // ---- Period comparison ----------------------------------------------------
@@ -355,14 +448,18 @@ type Aging struct {
 	TotalOutstanding float64       `json:"totalOutstanding"`
 	TotalOverdue     float64       `json:"totalOverdue"`
 	Buckets          []AgingBucket `json:"buckets"`
+	ItemCount        int           `json:"itemCount"` // debtor invoices in total
+	ItemsTruncated   bool          `json:"itemsTruncated,omitempty"`
 	Items            []AgingItem   `json:"items"`
 }
 
 // ReceivablesAging computes overdue accounts-receivable from customer invoices.
 // Outstanding = sum - payedSum. An item is overdue when its payment-planned
 // date is before now and something is still owed. Buckets: current, 1-30,
-// 31-60, 61-90, 90+.
-func ReceivablesAging(docs []moysklad.Document, now time.Time) Aging {
+// 31-60, 61-90, 90+. Totals and buckets always cover every debtor invoice;
+// limit (<=0 = all) only caps the per-invoice detail list so a large ledger
+// cannot blow up the response.
+func ReceivablesAging(docs []moysklad.Document, now time.Time, limit int) Aging {
 	buckets := []AgingBucket{
 		{Label: "current"}, {Label: "1-30"}, {Label: "31-60"}, {Label: "61-90"}, {Label: "90+"},
 	}
@@ -404,6 +501,11 @@ func ReceivablesAging(docs []moysklad.Document, now time.Time) Aging {
 	ag.TotalOverdue = round2(ag.TotalOverdue)
 	ag.Buckets = buckets
 	sort.SliceStable(ag.Items, func(i, j int) bool { return ag.Items[i].DaysOverdue > ag.Items[j].DaysOverdue })
+	ag.ItemCount = len(ag.Items)
+	if limit > 0 && limit < len(ag.Items) {
+		ag.Items = ag.Items[:limit]
+		ag.ItemsTruncated = true
+	}
 	return ag
 }
 

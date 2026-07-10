@@ -13,7 +13,7 @@ import (
 func init() { register(registerListProducts) }
 
 func registerListProducts(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("list_products",
+	tool := newTool("list_products",
 		mcp.WithDescription(
 			"List products from the MoySklad catalog. Use to look up items by "+
 				"name/article, check catalog contents, or resolve a product before "+

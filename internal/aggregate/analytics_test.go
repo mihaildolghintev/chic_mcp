@@ -172,7 +172,7 @@ func TestReceivablesAging(t *testing.T) {
 		// Overdue 100 days -> 90+ bucket.
 		{Name: "INV-4", Sum: 200_00, PayedSum: 0, PaymentPlannedMoment: "2026-03-23 00:00:00"},
 	}
-	ag := ReceivablesAging(docs, now)
+	ag := ReceivablesAging(docs, now, 0)
 
 	if ag.TotalOutstanding != 500+300+200 {
 		t.Errorf("total outstanding = %v, want 1000", ag.TotalOutstanding)
@@ -193,6 +193,40 @@ func TestReceivablesAging(t *testing.T) {
 	// Sorted most-overdue first.
 	if ag.Items[0].Document != "INV-4" {
 		t.Errorf("first item = %q, want INV-4 (most overdue)", ag.Items[0].Document)
+	}
+}
+
+func TestReceivablesAging_TruncatesItemsButNotTotals(t *testing.T) {
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	var docs []moysklad.Document
+	for i := 0; i < 5; i++ {
+		docs = append(docs, moysklad.Document{Name: "INV", Sum: 100_00, PayedSum: 0, PaymentPlannedMoment: "2026-06-01 00:00:00"})
+	}
+	ag := ReceivablesAging(docs, now, 2)
+
+	// Totals and item count cover all 5 despite the 2-row detail cap.
+	if ag.TotalOutstanding != 500 {
+		t.Errorf("outstanding = %v, want 500 (all 5)", ag.TotalOutstanding)
+	}
+	if ag.ItemCount != 5 || !ag.ItemsTruncated || len(ag.Items) != 2 {
+		t.Errorf("itemCount=%d truncated=%v len=%d, want 5/true/2", ag.ItemCount, ag.ItemsTruncated, len(ag.Items))
+	}
+}
+
+func TestABCReport_TotalsCoverAllDespiteTruncation(t *testing.T) {
+	items := ABC([]string{"a", "b", "c"}, func(s string) float64 {
+		return map[string]float64{"a": 100, "b": 60, "c": 5}[s]
+	}, 0.8, 0.95)
+	rep := ABCReport(items, 1)
+
+	if rep.Totals.Count != 3 || rep.Totals.Value != 165 {
+		t.Errorf("totals = %+v, want count 3 value 165", rep.Totals)
+	}
+	if rep.Returned != 1 || !rep.Truncated {
+		t.Errorf("returned=%d truncated=%v, want 1/true", rep.Returned, rep.Truncated)
+	}
+	if rep.Totals.ACount+rep.Totals.BCount+rep.Totals.CCount != 3 {
+		t.Errorf("class counts must sum to 3: %+v", rep.Totals)
 	}
 }
 

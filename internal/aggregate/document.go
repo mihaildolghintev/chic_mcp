@@ -13,7 +13,12 @@ type DocumentSummary struct {
 	State        string  `json:"state,omitempty"`
 	Store        string  `json:"store,omitempty"`
 	Channel      string  `json:"channel,omitempty"`
-	Applicable   bool    `json:"applicable"`
+	// Currency is the ISO code the amounts on THIS document are denominated in.
+	// Empty means the account base currency. When set and different from the
+	// account base, Sum/Paid are in this currency — do not mix with base-currency
+	// totals. Only populated when the request expands rate.currency.
+	Currency   string `json:"currency,omitempty"`
+	Applicable bool   `json:"applicable"`
 }
 
 func DocumentSummaryOf(d moysklad.Document) DocumentSummary {
@@ -24,6 +29,9 @@ func DocumentSummaryOf(d moysklad.Document) DocumentSummary {
 		Sum:        MinorToMajor(d.Sum),
 		Paid:       MinorToMajor(d.PayedSum),
 		Applicable: d.Applicable,
+	}
+	if d.Rate != nil && d.Rate.Currency != nil {
+		s.Currency = d.Rate.Currency.ISOCode
 	}
 	if d.Agent != nil {
 		s.Counterparty = d.Agent.Name
@@ -84,8 +92,9 @@ type PositionRow struct {
 	Code     string  `json:"code,omitempty"`
 	Quantity float64 `json:"quantity"`
 	Price    float64 `json:"price"`
-	Discount float64 `json:"discount,omitempty"`
-	Total    float64 `json:"total"`
+	Discount float64 `json:"discount,omitempty"` // percent
+	Vat      int     `json:"vat,omitempty"`      // VAT rate, percent
+	Total    float64 `json:"total"`              // price*qty net of discount
 }
 
 func DocumentDetailOf(d moysklad.Document) DocumentDetail {
@@ -98,13 +107,18 @@ func DocumentDetailOf(d moysklad.Document) DocumentDetail {
 	if d.Positions != nil {
 		for _, p := range d.Positions.Rows {
 			price := MinorToMajor(p.Price)
+			// МойСклад's document Sum is already net of line discounts, so the
+			// line total must subtract the discount too or the positions won't
+			// reconcile with the header.
+			total := price * p.Quantity * (1 - p.Discount/100)
 			det.Positions = append(det.Positions, PositionRow{
 				Name:     p.Assortment.Name,
 				Code:     p.Assortment.Code,
 				Quantity: p.Quantity,
 				Price:    price,
 				Discount: p.Discount,
-				Total:    round2(price * p.Quantity),
+				Vat:      p.Vat,
+				Total:    round2(total),
 			})
 		}
 	}

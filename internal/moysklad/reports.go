@@ -150,6 +150,12 @@ type StockOptions struct {
 	StockMode string
 	// GroupBy: product|variant|consignment.
 	GroupBy string
+	// Moment, when set (YYYY-MM-DD), returns the stock slice AS OF that date
+	// instead of the current snapshot. Empty means "now".
+	Moment string
+	// StoreID scopes the report to a single warehouse (store UUID). Empty means
+	// all warehouses combined.
+	StoreID string
 	Filter  []string
 	Limit   int
 }
@@ -161,6 +167,9 @@ func (o StockOptions) values() url.Values {
 	}
 	if o.GroupBy != "" {
 		v.Set("groupBy", o.GroupBy)
+	}
+	if m := normalizeMoment(o.Moment); m != "" {
+		v.Set("moment", m)
 	}
 	for _, f := range o.Filter {
 		v.Add("filter", f)
@@ -184,8 +193,12 @@ type StockRow struct {
 	StockDays int     `json:"stockDays"`
 }
 
-// GetStock fetches the extended stock report.
+// GetStock fetches the extended stock report. When opts.StoreID is set the
+// report is scoped to that single warehouse via a store filter.
 func (c *Client) GetStock(ctx context.Context, opts StockOptions) ([]StockRow, error) {
+	if opts.StoreID != "" {
+		opts.Filter = append(opts.Filter, "store="+c.baseURL+"/entity/store/"+opts.StoreID)
+	}
 	return getReportRows[StockRow](ctx, c, "/report/stock/all", opts.values(), opts.Limit)
 }
 
