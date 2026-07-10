@@ -6,7 +6,7 @@ import (
 	"mcp.chic.md/internal/moysklad"
 )
 
-func TestKopecksToRubles(t *testing.T) {
+func TestMinorToMajor(t *testing.T) {
 	cases := []struct {
 		kopecks float64
 		want    float64
@@ -19,8 +19,8 @@ func TestKopecksToRubles(t *testing.T) {
 		{100, 1.00},
 	}
 	for _, c := range cases {
-		if got := KopecksToRubles(c.kopecks); got != c.want {
-			t.Errorf("KopecksToRubles(%v) = %v, want %v", c.kopecks, got, c.want)
+		if got := MinorToMajor(c.kopecks); got != c.want {
+			t.Errorf("MinorToMajor(%v) = %v, want %v", c.kopecks, got, c.want)
 		}
 	}
 }

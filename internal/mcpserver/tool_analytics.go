@@ -27,7 +27,7 @@ func registerComparePeriods(s *server.MCPServer, api MoyskladAPI) {
 			"Compare two periods on revenue or profit, broken down by product or "+
 				"customer, and surface the biggest contributors to the change. Answers "+
 				"'why did revenue grow/fall between period A and period B' by ranking top "+
-				"gainers and decliners. Amounts in rubles.",
+				"gainers and decliners. Amounts are in the account's base currency.",
 		),
 		mcp.WithString("dimension", mcp.Description("product or counterparty. Default product.")),
 		mcp.WithString("metric", mcp.Description("revenue or profit. Default revenue.")),
@@ -104,7 +104,7 @@ func registerABCAnalysis(s *server.MCPServer, api MoyskladAPI) {
 			"ABC (Pareto) analysis of products or customers by revenue or profit over "+
 				"a period. Classes: A = top ~80% of value, B = next ~15%, C = long tail. "+
 				"Use to find the vital few products/customers that drive the business. "+
-				"Amounts in rubles.",
+				"Amounts are in the account's base currency.",
 		),
 		mcp.WithString("dimension", mcp.Description("product or counterparty. Default product.")),
 		mcp.WithString("metric", mcp.Description("revenue or profit. Default revenue.")),
@@ -146,12 +146,12 @@ func registerSegmentCounterparties(s *server.MCPServer, api MoyskladAPI) {
 				"customer with any of: vip (top revenue), sleeping (no purchase for a long "+
 				"time), at_risk (purchase gap growing), low_check (small average receipt), "+
 				"debtor (owes money), negative_margin (unprofitable). Heuristic, not a "+
-				"predictive model. Amounts in rubles.",
+				"predictive model. Amounts are in the account's base currency.",
 		),
 		mcp.WithNumber("sleeping_days", mcp.Description("No purchase for more than this many days -> sleeping. Default 90.")),
 		mcp.WithNumber("at_risk_days", mcp.Description("Purchase gap over this (but below sleeping) -> at_risk. Default 45.")),
 		mcp.WithNumber("vip_top_percent", mcp.Description("Top share by revenue tagged vip, 0-1. Default 0.2.")),
-		mcp.WithNumber("low_check_threshold", mcp.Description("Average receipt below this (rubles) -> low_check. Default off.")),
+		mcp.WithNumber("low_check_threshold", mcp.Description("Average receipt below this (in the account's base currency) -> low_check. Default off.")),
 		mcp.WithNumber("limit", mcp.Description("Max customers to scan. Default 1000, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -176,7 +176,7 @@ func registerDeadStock(s *server.MCPServer, api MoyskladAPI) {
 	tool := mcp.NewTool("dead_stock",
 		mcp.WithDescription(
 			"Find dead/slow stock: items on hand for at least threshold_days with no "+
-				"outbound movement in the period. Sorted by tied-up value (rubles). Use for "+
+				"outbound movement in the period. Sorted by tied-up value. Use for "+
 				"'what isn't selling', 'what's gathering dust', 'how much money is frozen'.",
 		),
 		mcp.WithNumber("threshold_days", mcp.Description("Minimum age on warehouse in days. Default 90.")),
@@ -217,7 +217,7 @@ func registerReceivablesAging(s *server.MCPServer, api MoyskladAPI) {
 			"Accounts-receivable aging from customer invoices: total outstanding, "+
 				"total overdue, and buckets (current, 1-30, 31-60, 61-90, 90+ days overdue) "+
 				"plus per-invoice detail sorted by days overdue. Use for 'who owes us and "+
-				"how late'. Amounts in rubles.",
+				"how late'. Amounts are in the account's base currency.",
 		),
 		mcp.WithNumber("limit", mcp.Description("Max invoices to scan. Default 1000, max 1000.")),
 	)

@@ -40,6 +40,12 @@ type Options struct {
 	HistoryDepth int           // dialog turns replayed from the store (default 20)
 	RatePerHour  int           // per-chat requests per hour, 0 = default 30, <0 = unlimited
 	Timeout      time.Duration // wall-clock cap per request (default 3m)
+
+	// CurrencyCode and CurrencyName label monetary amounts in the system
+	// prompt — the account's base currency (e.g. "MDL"/"лей"), resolved once at
+	// startup. Empty falls back to a currency-neutral instruction.
+	CurrencyCode string
+	CurrencyName string
 }
 
 func (o Options) withDefaults() Options {
@@ -170,7 +176,7 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 	}
 
 	msgs := make([]llm.Message, 0, len(history)+2)
-	msgs = append(msgs, llm.System(systemPrompt(time.Now())))
+	msgs = append(msgs, llm.System(systemPrompt(time.Now(), a.opts.CurrencyCode, a.opts.CurrencyName)))
 	for _, h := range history {
 		msgs = append(msgs, llm.Message{Role: h.Role, Text: h.Content})
 	}
@@ -290,8 +296,10 @@ func (a *Agent) allow(chatID int64) bool {
 	return lim.Allow()
 }
 
-// systemPrompt is rebuilt per request so "сегодня" is always today.
-func systemPrompt(now time.Time) string {
+// systemPrompt is rebuilt per request so "сегодня" is always today. currencyCode
+// and currencyName label monetary amounts; empty falls back to a neutral hint,
+// since the account's currency must never be assumed to be rubles.
+func systemPrompt(now time.Time, currencyCode, currencyName string) string {
 	return fmt.Sprintf(`Ты — ассистент по данным МойСклад магазина Chic. Сегодня %s.
 
 У тебя есть инструменты только для ЧТЕНИЯ данных МойСклад: товары, остатки,
@@ -299,8 +307,7 @@ func systemPrompt(now time.Time) string {
 (ABC-анализ, сравнение периодов, мёртвый сток, дебиторка).
 
 Правила:
-- Отвечай на русском, кратко и по делу. Суммы — в рублях, тысячи отделяй
-  пробелом: 12 345 ₽.
+- Отвечай на русском, кратко и по делу. %s
 - Данные бери только из инструментов, ничего не выдумывай.
 - Если вопрос про период ("за неделю", "в марте") — вычисли даты от сегодняшней.
 - Если вопрос неоднозначный, задай короткий уточняющий вопрос вместо догадок.
@@ -316,5 +323,23 @@ func systemPrompt(now time.Time) string {
   помести в цитату «> …» — длинная цитата в Telegram сворачивается.
 - Артикулы, коды и номера документов оборачивай в `+"`моноширинный`"+`.
 - Держи строки короткими: ответ читают с телефона.`,
-		now.Format("2006-01-02 (Monday)"))
+		now.Format("2006-01-02 (Monday)"), moneyRule(currencyCode, currencyName))
+}
+
+// moneyRule builds the currency-formatting line of the system prompt from the
+// account's resolved base currency. It never assumes rubles: with no resolved
+// currency it tells the model to use MoySklad's own currency labels.
+func moneyRule(code, name string) string {
+	switch {
+	case code != "" && name != "":
+		return fmt.Sprintf("Суммы — в валюте учёта (%s, %s), тысячи отделяй "+
+			"пробелом и добавляй код: 12 345 %s.", name, code, code)
+	case code != "":
+		return fmt.Sprintf("Суммы — в валюте учёта, тысячи отделяй пробелом и "+
+			"добавляй код: 12 345 %s.", code)
+	default:
+		return "Суммы — в валюте учёта аккаунта МойСклад (не предполагай рубли; " +
+			"если валюта неизвестна, вызови инструмент get_account_currency). " +
+			"Тысячи отделяй пробелом."
+	}
 }

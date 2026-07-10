@@ -3,16 +3,16 @@ package aggregate
 import "mcp.chic.md/internal/moysklad"
 
 // ProductSummary is the compact product shape handed to the LLM. Prices are in
-// rubles (converted from MoySklad kopecks) — never expose raw kopecks upward.
+// major units (converted from MoySklad minor units) — never expose raw minor units upward.
 type ProductSummary struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Code     string `json:"code,omitempty"`
 	Article  string `json:"article,omitempty"`
 	Archived bool   `json:"archived"`
-	// SalePrice is the first configured sale price, in rubles. 0 if unset.
+	// SalePrice is the first configured sale price, in major units. 0 if unset.
 	SalePrice float64 `json:"salePrice"`
-	// BuyPrice is the purchase price, in rubles. 0 if unset.
+	// BuyPrice is the purchase price, in major units. 0 if unset.
 	BuyPrice float64 `json:"buyPrice"`
 }
 
@@ -26,10 +26,10 @@ func Product(p moysklad.Product) ProductSummary {
 		Archived: p.Archived,
 	}
 	if len(p.SalePrices) > 0 {
-		s.SalePrice = KopecksToRubles(p.SalePrices[0].Value)
+		s.SalePrice = MinorToMajor(p.SalePrices[0].Value)
 	}
 	if p.BuyPrice != nil {
-		s.BuyPrice = KopecksToRubles(p.BuyPrice.Value)
+		s.BuyPrice = MinorToMajor(p.BuyPrice.Value)
 	}
 	return s
 }

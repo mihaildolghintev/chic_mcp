@@ -17,7 +17,7 @@ func registerListProducts(s *server.MCPServer, api MoyskladAPI) {
 		mcp.WithDescription(
 			"List products from the MoySklad catalog. Use to look up items by "+
 				"name/article, check catalog contents, or resolve a product before "+
-				"querying stock. Prices are returned in rubles. Returns id, name, "+
+				"querying stock. Prices are in the account's base currency. Returns id, name, "+
 				"code, article, archived flag, sale price and buy price.",
 		),
 		mcp.WithString("query",

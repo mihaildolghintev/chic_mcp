@@ -101,7 +101,7 @@ type SegmentParams struct {
 	SleepingDays      int     // no purchase for longer than this -> "sleeping" (default 90)
 	AtRiskDays        int     // gap between this and SleepingDays -> "at_risk" (default 45)
 	VIPTopPercent     float64 // top X by revenue share -> "vip" (default 0.2)
-	LowCheckThreshold float64 // avg receipt below this (rubles) -> "low_check" (default 0 = off)
+	LowCheckThreshold float64 // avg receipt below this (base currency) -> "low_check" (default 0 = off)
 }
 
 func (p SegmentParams) withDefaults() SegmentParams {
@@ -368,7 +368,7 @@ func ReceivablesAging(docs []moysklad.Document, now time.Time) Aging {
 	}
 	ag := Aging{}
 	for _, d := range docs {
-		outstanding := KopecksToRubles(d.Sum - d.PayedSum)
+		outstanding := MinorToMajor(d.Sum - d.PayedSum)
 		if outstanding <= 0 {
 			continue
 		}

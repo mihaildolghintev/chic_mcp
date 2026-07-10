@@ -3,7 +3,7 @@ package aggregate
 import "mcp.chic.md/internal/moysklad"
 
 // This file maps raw MoySklad report rows into compact, LLM-friendly DTOs.
-// Every monetary field is converted from kopecks to rubles here. Margins are
+// Every monetary field is converted from minor to major units here. Margins are
 // recomputed as profit/revenue*100 so the value is unambiguous regardless of
 // how MoySklad encodes its own `margin` field.
 
@@ -21,20 +21,20 @@ type DashboardSummary struct {
 	MoneyBalance float64 `json:"moneyBalance"`
 }
 
-// Dashboard money amounts are assumed to be kopecks (as elsewhere in MoySklad);
-// verify against a real account and adjust here if a field turns out to be in
-// major units.
+// Dashboard money amounts are assumed to be in minor units (as elsewhere in
+// MoySklad); verify against a real account and adjust here if a field turns out
+// to be in major units.
 func Dashboard(period string, d *moysklad.Dashboard) DashboardSummary {
 	return DashboardSummary{
 		Period:       period,
 		SalesCount:   d.Sales.Count,
-		SalesAmount:  KopecksToRubles(d.Sales.Amount),
-		SalesDelta:   KopecksToRubles(d.Sales.MovementAmount),
+		SalesAmount:  MinorToMajor(d.Sales.Amount),
+		SalesDelta:   MinorToMajor(d.Sales.MovementAmount),
 		OrdersCount:  d.Orders.Count,
-		OrdersAmount: KopecksToRubles(d.Orders.Amount),
-		MoneyIncome:  KopecksToRubles(d.Money.Income),
-		MoneyOutcome: KopecksToRubles(d.Money.Outcome),
-		MoneyBalance: KopecksToRubles(d.Money.Balance),
+		OrdersAmount: MinorToMajor(d.Orders.Amount),
+		MoneyIncome:  MinorToMajor(d.Money.Income),
+		MoneyOutcome: MinorToMajor(d.Money.Outcome),
+		MoneyBalance: MinorToMajor(d.Money.Balance),
 	}
 }
 
@@ -54,15 +54,15 @@ type ProfitProductLine struct {
 func ProfitByProduct(rows []moysklad.ProfitByProductRow) []ProfitProductLine {
 	out := make([]ProfitProductLine, 0, len(rows))
 	for _, r := range rows {
-		revenue := KopecksToRubles(r.SellSum)
-		profit := KopecksToRubles(r.Profit)
+		revenue := MinorToMajor(r.SellSum)
+		profit := MinorToMajor(r.Profit)
 		out = append(out, ProfitProductLine{
 			Name:         r.Assortment.Name,
 			Code:         r.Assortment.Code,
 			SellQuantity: r.SellQuantity,
 			Revenue:      revenue,
-			Cost:         KopecksToRubles(r.SellCostSum),
-			ReturnSum:    KopecksToRubles(r.ReturnSum),
+			Cost:         MinorToMajor(r.SellCostSum),
+			ReturnSum:    MinorToMajor(r.ReturnSum),
 			Profit:       profit,
 			MarginPct:    marginPct(profit, revenue),
 		})
@@ -83,15 +83,15 @@ type ProfitEntityLine struct {
 func ProfitByEntity(rows []moysklad.ProfitByEntityRow) []ProfitEntityLine {
 	out := make([]ProfitEntityLine, 0, len(rows))
 	for _, r := range rows {
-		revenue := KopecksToRubles(r.SellSum)
-		profit := KopecksToRubles(r.Profit)
+		revenue := MinorToMajor(r.SellSum)
+		profit := MinorToMajor(r.Profit)
 		out = append(out, ProfitEntityLine{
 			Name:       r.Name(),
 			Revenue:    revenue,
-			Cost:       KopecksToRubles(r.SellCostSum),
+			Cost:       MinorToMajor(r.SellCostSum),
 			Profit:     profit,
 			SalesCount: r.SalesCount,
-			AvgCheck:   KopecksToRubles(r.SalesAvgCheck),
+			AvgCheck:   MinorToMajor(r.SalesAvgCheck),
 			MarginPct:  marginPct(profit, revenue),
 		})
 	}
@@ -123,7 +123,7 @@ func Turnover(rows []moysklad.TurnoverRow, periodDays float64) []TurnoverLine {
 			IncomeQty:    r.Income.Quantity,
 			OutcomeQty:   r.Outcome.Quantity,
 			EndQty:       r.OnPeriodEnd.Quantity,
-			EndValue:     KopecksToRubles(r.OnPeriodEnd.Sum),
+			EndValue:     MinorToMajor(r.OnPeriodEnd.Sum),
 			TurnoverDays: turnoverDays(r, periodDays),
 		})
 	}
@@ -162,7 +162,7 @@ type StockLine struct {
 func Stock(rows []moysklad.StockRow) []StockLine {
 	out := make([]StockLine, 0, len(rows))
 	for _, r := range rows {
-		cost := KopecksToRubles(r.Price)
+		cost := MinorToMajor(r.Price)
 		out = append(out, StockLine{
 			Name:       r.Name,
 			Code:       r.Code,
@@ -172,7 +172,7 @@ func Stock(rows []moysklad.StockRow) []StockLine {
 			Available:  r.Stock - r.Reserve,
 			InTransit:  r.InTransit,
 			CostPrice:  cost,
-			SalePrice:  KopecksToRubles(r.SalePrice),
+			SalePrice:  MinorToMajor(r.SalePrice),
 			StockValue: round2(r.Stock * cost),
 			StockDays:  r.StockDays,
 		})
@@ -202,11 +202,11 @@ func CounterpartyMetrics(rows []moysklad.CounterpartyRow) []CounterpartyMetric {
 			FirstDemand:  r.FirstDemandDate,
 			LastDemand:   r.LastDemandDate,
 			DemandsCount: r.DemandsCount,
-			Revenue:      KopecksToRubles(r.DemandsSum),
-			AvgReceipt:   KopecksToRubles(r.AverageReceipt),
-			ReturnsSum:   KopecksToRubles(r.ReturnsSum),
-			Balance:      KopecksToRubles(r.Balance),
-			Profit:       KopecksToRubles(r.Profit),
+			Revenue:      MinorToMajor(r.DemandsSum),
+			AvgReceipt:   MinorToMajor(r.AverageReceipt),
+			ReturnsSum:   MinorToMajor(r.ReturnsSum),
+			Balance:      MinorToMajor(r.Balance),
+			Profit:       MinorToMajor(r.Profit),
 		})
 	}
 	return out
@@ -229,15 +229,15 @@ type MoneyFlowPoint struct {
 }
 
 func Money(m *moysklad.MoneySeries) MoneyFlow {
-	income := KopecksToRubles(m.Credit)
-	outcome := KopecksToRubles(m.Debit)
+	income := MinorToMajor(m.Credit)
+	outcome := MinorToMajor(m.Debit)
 	pts := make([]MoneyFlowPoint, 0, len(m.Series))
 	for _, p := range m.Series {
 		pts = append(pts, MoneyFlowPoint{
 			Date:    p.Date,
-			Income:  KopecksToRubles(p.Credit),
-			Outcome: KopecksToRubles(p.Debit),
-			Balance: KopecksToRubles(p.Balance),
+			Income:  MinorToMajor(p.Credit),
+			Outcome: MinorToMajor(p.Debit),
+			Balance: MinorToMajor(p.Balance),
 		})
 	}
 	return MoneyFlow{Income: income, Outcome: outcome, Net: round2(income - outcome), Series: pts}

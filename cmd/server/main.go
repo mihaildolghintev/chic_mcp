@@ -120,6 +120,21 @@ func buildAPI(token string) (mcpserver.MoyskladAPI, func()) {
 	}
 }
 
+// resolveCurrency looks up the account's base currency for the agent's system
+// prompt. It uses a short timeout and never fails the boot — an empty result
+// just yields a currency-neutral prompt.
+func resolveCurrency(ctx context.Context, api mcpserver.MoyskladAPI) (code, name string) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cur, err := api.AccountCurrency(ctx)
+	if err != nil {
+		slog.Warn("could not resolve account currency; amounts will be labeled generically", "err", err)
+		return "", ""
+	}
+	slog.Info("account currency resolved", "isoCode", cur.ISOCode, "name", cur.Name)
+	return cur.ISOCode, cur.Name
+}
+
 // runBot is the production mode: Telegram webhook + worker pool + /healthz,
 // with the MCP-backed LLM agent answering messages.
 func runBot() {
@@ -154,7 +169,16 @@ func runBot() {
 	}
 	defer func() { _ = appDB.Close() }()
 
-	ag, err := agent.New(ctx, llmClient, mcpserver.New(api), appDB, agent.Options{})
+	// Resolve the account's base currency once so the agent labels amounts
+	// correctly (lei, rubles, euro, …) instead of assuming rubles. A failure
+	// here is non-fatal: the agent falls back to a currency-neutral prompt and
+	// can still call get_account_currency at runtime.
+	curCode, curName := resolveCurrency(ctx, api)
+
+	ag, err := agent.New(ctx, llmClient, mcpserver.New(api), appDB, agent.Options{
+		CurrencyCode: curCode,
+		CurrencyName: curName,
+	})
 	if err != nil {
 		slog.Error("agent init", "err", err)
 		os.Exit(1)

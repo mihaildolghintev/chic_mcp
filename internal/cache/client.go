@@ -25,6 +25,7 @@ type Source interface {
 	SearchDocuments(ctx context.Context, docType moysklad.DocumentType, q moysklad.DocumentQuery) ([]moysklad.Document, error)
 	GetDocument(ctx context.Context, docType moysklad.DocumentType, id string, expand []string) (*moysklad.Document, error)
 	SearchCounterparties(ctx context.Context, opts moysklad.ListOptions) ([]moysklad.Counterparty, error)
+	AccountCurrency(ctx context.Context) (*moysklad.Currency, error)
 }
 
 // TTLs holds the cache lifetime per call class. Zero disables caching for that
@@ -35,6 +36,7 @@ type TTLs struct {
 	Reports      time.Duration // profit, turnover, stock, counterparty, money
 	Documents    time.Duration
 	Counterparty time.Duration // entity/counterparty search
+	Currency     time.Duration // entity/currency (account currency)
 }
 
 // DefaultTTLs returns sensible cache lifetimes. Reports change on the order of
@@ -46,6 +48,7 @@ func DefaultTTLs() TTLs {
 		Reports:      10 * time.Minute,
 		Documents:    5 * time.Minute,
 		Counterparty: 30 * time.Minute,
+		Currency:     24 * time.Hour,
 	}
 }
 
@@ -160,5 +163,11 @@ func (c *Client) GetDocument(ctx context.Context, docType moysklad.DocumentType,
 func (c *Client) SearchCounterparties(ctx context.Context, opts moysklad.ListOptions) ([]moysklad.Counterparty, error) {
 	return do(c, c.ttl.Counterparty, "SearchCounterparties", opts, func() ([]moysklad.Counterparty, error) {
 		return c.src.SearchCounterparties(ctx, opts)
+	})
+}
+
+func (c *Client) AccountCurrency(ctx context.Context) (*moysklad.Currency, error) {
+	return do(c, c.ttl.Currency, "AccountCurrency", nil, func() (*moysklad.Currency, error) {
+		return c.src.AccountCurrency(ctx)
 	})
 }
