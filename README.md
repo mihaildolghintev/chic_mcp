@@ -3,8 +3,7 @@
 A Go monolith: a private Telegram bot that answers business questions about a
 MoySklad account. Messages go to an LLM agent (DeepSeek for text, OpenAI for
 photos) that calls 15 read-only MoySklad [MCP](https://modelcontextprotocol.io)
-tools in-process and replies in plain Russian. Deployed with Kamal to
-`bot.chic.md`.
+tools in-process and replies in plain Russian.
 
 ## How it works
 
@@ -140,10 +139,10 @@ MoySklad).
 
 ## Deploy
 
-Kamal 2 to a Hetzner box, fronted by kamal-proxy with Let's Encrypt for
-`bot.chic.md`. `main` is merged freely (CI only); production deploys when a
-GitHub Release is published — the Deploy workflow builds the image, pushes it
-to a private GHCR package and runs `kamal deploy` over SSH.
-
-Full runbook — release flow, secrets, manual deploys, rollback,
-troubleshooting: [DEPLOY.md](DEPLOY.md).
+The repo is deployment-agnostic: it ships a [Dockerfile](Dockerfile) that
+builds a single static binary image listening on `LISTEN_ADDR` (default
+`:8080`) with a health check at `/healthz`, and persists SQLite files at the
+paths given by `CACHE_DB`/`APP_DB` — mount a volume there. Run it anywhere
+that can run a container; see [.env.example](.env.example) for the required
+environment. Concrete deployment configs (servers, domains, secrets) live
+outside this repo.
