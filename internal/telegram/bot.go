@@ -6,6 +6,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -160,9 +161,23 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 // maxMessageLen is Telegram's hard cap on sendMessage text.
 const maxMessageLen = 4096
 
+// reply delivers text as Telegram-HTML. The text is sanitized first (the
+// agent is prompted to emit HTML, but the sanitizer is what guarantees it
+// parses), split into limit-sized chunks with tags balanced per chunk, and if
+// Telegram still rejects a chunk with 400 it is resent as plain text — a
+// degraded answer beats a swallowed one.
 func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string) {
-	for _, chunk := range splitMessage(text, maxMessageLen) {
-		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunk}); err != nil {
+	for _, chunk := range splitHTML(sanitizeHTML(text), maxMessageLen) {
+		_, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:    chatID,
+			Text:      chunk,
+			ParseMode: models.ParseModeHTML,
+		})
+		if err != nil && errors.Is(err, bot.ErrorBadRequest) {
+			log.Warn("HTML reply rejected, resending as plain text", "err", err)
+			_, err = b.api.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: stripTags(chunk)})
+		}
+		if err != nil {
 			log.Error("sendMessage failed", "err", err)
 			return
 		}
