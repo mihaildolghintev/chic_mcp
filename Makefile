@@ -11,7 +11,7 @@ CACHE_DIR := $(HOME)/.moysklad-mcp
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X mcp.chic.md/internal/buildinfo.Version=$(VERSION)
 
-.PHONY: build install test fmt vet clean run-stdio run-bot config
+.PHONY: build install test fmt vet ci clean run-stdio run-bot config
 
 ## build: compile a native static binary into ./bin
 build:
@@ -33,6 +33,10 @@ fmt:
 
 vet:
 	go vet ./...
+
+## ci: run the full CI suite locally (lint, build, race tests, security) before a PR
+ci:
+	./scripts/ci.sh
 
 clean:
 	rm -rf $(BIN_DIR)

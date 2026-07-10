@@ -79,7 +79,7 @@ func (r *tgRenderer) render(n ast.Node) string {
 	case *east.Strikethrough:
 		return "<s>" + r.inlineChildren(n) + "</s>"
 	case *ast.CodeSpan:
-		return "<code>" + escText(n.Text(r.src)) + "</code>"
+		return "<code>" + escText(r.rawText(n)) + "</code>"
 	case *ast.Link:
 		return r.link(string(n.Destination), r.inlineChildren(n))
 	case *ast.AutoLink:
@@ -113,6 +113,18 @@ func (r *tgRenderer) blockChildren(n ast.Node, sep string) string {
 		}
 	}
 	return strings.Join(parts, sep)
+}
+
+// rawText collects the unescaped source text of a node's Text children — used
+// for code spans, whose content must be taken verbatim, not rendered.
+func (r *tgRenderer) rawText(n ast.Node) []byte {
+	var b []byte
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		if t, ok := c.(*ast.Text); ok {
+			b = append(b, t.Segment.Value(r.src)...)
+		}
+	}
+	return b
 }
 
 // inlineChildren concatenates the rendered inline children with no separator.
