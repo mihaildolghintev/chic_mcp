@@ -324,6 +324,12 @@ func (a *Agent) allow(userID int64) bool {
 // since the account's currency must never be assumed to be rubles. prefs are the
 // user's durable preferences, rendered into the prompt so the model honours them
 // across sessions without re-asking.
+//
+// The prompt itself is Russian (the operators' language), but it tells the model
+// to answer in the question's language and never mix languages — English field
+// names from tool results (revenue, turnover, stock…) must be translated into
+// the answer's language, not echoed verbatim. A stored "language" preference
+// overrides the question's language.
 func systemPrompt(now time.Time, currencyCode, currencyName string, prefs []store.Preference) string {
 	return fmt.Sprintf(`Ты — ассистент по данным МойСклад магазина Chic. Сегодня %s.
 
@@ -332,8 +338,18 @@ func systemPrompt(now time.Time, currencyCode, currencyName string, prefs []stor
 (ABC-анализ, сравнение периодов, мёртвый сток, дебиторка).
 
 Правила:
-- Отвечай кратко и по делу на русском — если в «Предпочтениях» ниже не указан
-  другой язык общения. %s
+- Отвечай кратко и по делу.
+- Язык ответа — тот же, на котором задан текущий вопрос (русский → по-русски,
+  английский → по-английски, румынский → по-румынски). Исключение: если в
+  «Предпочтениях» ниже задан язык общения, используй его вместо языка вопроса.
+- Весь ответ — строго на одном языке, без смешивания. Инструменты отдают названия
+  показателей по-английски (revenue, profit, turnover, stock, reserve, margin,
+  in-transit, cost) — переводи их на язык ответа (выручка, прибыль, оборот,
+  остатки, резерв, маржа, в пути, себестоимость). Не оставляй английские слова в
+  русском тексте и русские — в английском.
+- Если у термина нет устоявшегося перевода — дай перевод, а оригинал приведи в
+  скобках один раз при первом упоминании; дальше используй только перевод.
+- %s
 - Данные бери только из инструментов, ничего не выдумывай.
 - Если вопрос про период ("за неделю", "в марте") — вычисли даты от сегодняшней.
 - Если вопрос неоднозначный, задай короткий уточняющий вопрос вместо догадок.
