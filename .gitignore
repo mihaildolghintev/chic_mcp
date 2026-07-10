@@ -7,8 +7,6 @@
 # Local env / secrets
 .env
 *.local
-# Raw deploy secrets for laptop deploys (template: .envrc.example).
-# NB: .kamal/secrets is committed — it only maps env vars, no raw values.
 .envrc
 
 # SQLite cache
