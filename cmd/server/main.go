@@ -251,6 +251,22 @@ func runBot() {
 		os.Exit(1)
 	}
 	bot.OnNewSession(ag.Reset)
+	// The /memory command reads and prunes the user's durable preferences. Adapt
+	// the agent's store-backed methods to the bot's package-local MemoryItem.
+	bot.OnMemory(
+		func(ctx context.Context, userID int64) ([]telegram.MemoryItem, error) {
+			prefs, err := ag.Preferences(ctx, userID)
+			if err != nil {
+				return nil, err
+			}
+			items := make([]telegram.MemoryItem, len(prefs))
+			for i, p := range prefs {
+				items[i] = telegram.MemoryItem{Key: p.Key, Value: p.Value}
+			}
+			return items, nil
+		},
+		ag.ForgetPreference,
+	)
 
 	me, err := bot.Me(ctx)
 	if err != nil {

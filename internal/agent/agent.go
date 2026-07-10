@@ -27,19 +27,23 @@ import (
 // Friendly replies for the failure modes a user can do something about.
 // Internal errors are returned as errors — the bot layer owns that wording.
 const (
-	msgRateLimited  = "Слишком много запросов — сделайте паузу и попробуйте позже."
-	msgBudgetSpent  = "Запрос вышел слишком дорогим, я остановил обработку. Попробуйте сузить вопрос."
-	msgTooManyloops = "Не смог собрать ответ за разумное число шагов. Попробуйте разбить вопрос на части."
-	msgNoVision     = "Обработка фото не настроена (нет vision-провайдера). Пришлите вопрос текстом."
+	msgRateLimited = "Слишком много запросов — сделайте паузу и попробуйте позже."
+	msgBudgetSpent = "Запрос вышел слишком дорогим, я остановил обработку. Попробуйте сузить вопрос."
+	msgNoVision    = "Обработка фото не настроена (нет vision-провайдера). Пришлите вопрос текстом."
 )
 
 // Options tune the agent; zero values take the defaults below.
 type Options struct {
-	MaxRounds    int           // LLM⇄tools round trips per request (default 6)
-	MaxTokens    int           // cumulative token stop-loss per request (default 200k)
+	MaxRounds    int           // LLM⇄tools round trips per request (default 50)
+	MaxTokens    int           // cumulative token stop-loss per request (default 1M)
 	HistoryDepth int           // dialog turns replayed from the store (default 20)
 	RatePerHour  int           // per-user requests per hour, 0 = default 30, <0 = unlimited
 	Timeout      time.Duration // wall-clock cap per request (default 3m)
+
+	// SummaryCharBudget is the total size (in chars) of replayed history above
+	// which older turns are folded into an LLM summary instead of replayed
+	// verbatim. 0 = default 8000; <0 disables summarization.
+	SummaryCharBudget int
 
 	// CurrencyCode and CurrencyName label monetary amounts in the system
 	// prompt — the account's base currency (e.g. "MDL"/"лей"), resolved once at
@@ -50,10 +54,18 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxRounds <= 0 {
-		o.MaxRounds = 6
+		// Set high on purpose: the real guards on a runaway loop are the token
+		// stop-loss (MaxTokens) and the wall-clock Timeout, not a step count. The
+		// round budget is only a last-resort backstop, so it must be far above any
+		// legitimately long tool chain — the user should never hit it in practice.
+		o.MaxRounds = 50
 	}
 	if o.MaxTokens <= 0 {
-		o.MaxTokens = 200_000
+		// A generous stop-loss: the primary provider (DeepSeek) is cheap enough
+		// that a legitimately deep, tool-heavy request should never be cut off by
+		// this. It stays only as a backstop against a pathological loop; the
+		// wall-clock Timeout is the tighter real-world guard.
+		o.MaxTokens = 1_000_000
 	}
 	if o.HistoryDepth <= 0 {
 		o.HistoryDepth = 20
@@ -63,6 +75,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 3 * time.Minute
+	}
+	if o.SummaryCharBudget == 0 {
+		o.SummaryCharBudget = 8000
 	}
 	return o
 }
@@ -186,8 +201,15 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 		stored = strings.TrimSpace("[фото] " + text)
 	}
 
-	msgs := make([]llm.Message, 0, len(history)+2)
+	// Fold an overflowing history into a short summary so a long conversation
+	// keeps its context without blowing the window on every request.
+	summary, history := a.condenseHistory(ctx, log, history)
+
+	msgs := make([]llm.Message, 0, len(history)+3)
 	msgs = append(msgs, llm.System(systemPrompt(time.Now(), a.opts.CurrencyCode, a.opts.CurrencyName, prefs)))
+	if summary != "" {
+		msgs = append(msgs, llm.System("Краткое содержание более раннего диалога (для контекста, не пересказывай его дословно):\n"+summary))
+	}
 	for _, h := range history {
 		msgs = append(msgs, llm.Message{Role: h.Role, Text: h.Content})
 	}
@@ -227,8 +249,26 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 		}
 	}
 
-	log.Warn("agent hit round limit", "rounds", a.opts.MaxRounds, "tokens", spent)
-	return msgTooManyloops, nil
+	// Out of tool rounds. Rather than bail with a "couldn't do it" message, ask
+	// once more with no tools offered so the model must answer from what it has
+	// already gathered — the user gets a best-effort reply, not a dead end.
+	log.Warn("agent hit round limit, forcing a final answer", "rounds", a.opts.MaxRounds, "tokens", spent)
+	return a.forceFinalAnswer(ctx, log, userID, stored, msgs)
+}
+
+// forceFinalAnswer runs one last completion with no tools, so the model can only
+// reply with text. It is the round-limit fallback: a synthesized answer from the
+// context gathered so far beats telling the user to rephrase. Errors propagate
+// (the bot renders its own generic apology); an empty reply is returned as-is.
+func (a *Agent) forceFinalAnswer(ctx context.Context, log *slog.Logger, userID int64, stored string, msgs []llm.Message) (string, error) {
+	resp, err := a.llm.Chat(ctx, llm.Request{Messages: msgs}) // no Tools: text only
+	if err != nil {
+		return "", fmt.Errorf("agent: forced final answer: %w", err)
+	}
+	answer := strings.TrimSpace(resp.Message.Text)
+	a.remember(ctx, log, userID, stored, answer)
+	log.Info("agent answered (forced)", "tokens", resp.Usage.TotalTokens, "provider", resp.Provider)
+	return answer, nil
 }
 
 // dispatchTool routes one tool call. Memory tools are handled locally against
@@ -368,6 +408,8 @@ func systemPrompt(now time.Time, currencyCode, currencyName string, prefs []stor
 - Если пожелание изменилось — перезапиши тем же ключом; если отменено — удали
   через forget_preference. Не переспрашивай то, что уже есть в «Предпочтениях».
 - Сохранение — молча, не сообщай о нём отдельным предложением.
+- Если пользователь хочет посмотреть или почистить сохранённое — подскажи команду
+  /memory (список предпочтений с кнопками удаления). Готовые вопросы — команда /menu.
 %s
 Формат: пиши обычным Markdown — он отображается в Telegram.
 - Разметка: **жирный**, *курсив*, `+"`моноширинный`"+`, > цитата, списки «- пункт»,

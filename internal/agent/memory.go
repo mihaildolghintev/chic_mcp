@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"unicode/utf8"
 
 	"mcp.chic.md/internal/llm"
+	"mcp.chic.md/internal/store"
 )
 
 // The agent-local memory tools. Unlike the MoySklad tools (served by the
@@ -117,6 +119,10 @@ func (a *Agent) callMemoryTool(ctx context.Context, userID int64, tc llm.ToolCal
 		if err := a.store.SetPreference(ctx, userID, key, value); err != nil {
 			return "ERROR: не удалось сохранить предпочтение: " + err.Error()
 		}
+		// A profile that has grown large is where duplicate/synonymous keys and
+		// stale contradictions accumulate — fold them together now, silently and
+		// best-effort, so the next prompt carries a clean profile.
+		a.maybeConsolidate(ctx, userID)
 		return fmt.Sprintf("OK: сохранено %s = %s", key, value)
 	case toolForgetPreference:
 		if err := a.store.DeletePreference(ctx, userID, key); err != nil {
@@ -126,4 +132,155 @@ func (a *Agent) callMemoryTool(ctx context.Context, userID int64, tc llm.ToolCal
 	default:
 		return "ERROR: неизвестный инструмент памяти: " + tc.Function.Name
 	}
+}
+
+// Preferences returns the user's durable preferences — the read side the
+// /memory command renders. It is a thin pass-through to the store so the bot
+// layer never depends on the store package directly.
+func (a *Agent) Preferences(ctx context.Context, userID int64) ([]store.Preference, error) {
+	return a.store.Preferences(ctx, userID)
+}
+
+// ForgetPreference deletes one durable preference for userID — the write side
+// of the /memory command's delete buttons. Deleting a missing key is a no-op,
+// mirroring forget_preference.
+func (a *Agent) ForgetPreference(ctx context.Context, userID int64, key string) error {
+	return a.store.DeletePreference(ctx, userID, key)
+}
+
+// consolidateThreshold is the profile size at or above which maybeConsolidate
+// runs a merge pass. Below it, a handful of keys can't have accumulated enough
+// duplication or contradiction to be worth an LLM round-trip. It is a soft cap,
+// well under maxRenderedPreferences.
+const consolidateThreshold = 8
+
+// consolidatedProfile is the strict JSON shape the model must return from a
+// consolidation pass: the whole desired profile, deduplicated and free of
+// contradictions.
+type consolidatedProfile struct {
+	Preferences []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	} `json:"preferences"`
+}
+
+const consolidateSystemPrompt = `Тебе дают текущий профиль предпочтений пользователя (список key/value).
+Верни его КАНОНИЧЕСКУЮ версию: объедини дубли и синонимичные ключи в один,
+устрани противоречия (оставь наиболее конкретное/полное значение), выкини пустое и мусор.
+Ключи — стабильные идентификаторы на латинице (language, reply_style, main_warehouse и т.п.),
+значения — короткие (до 200 символов). Не добавляй ничего нового, только консолидируй имеющееся.
+Ответ — СТРОГО JSON вида {"preferences":[{"key":"...","value":"..."}]} и ничего кроме него.`
+
+// maybeConsolidate folds a large preference profile into a canonical, dedup'd,
+// contradiction-free set. It runs only past consolidateThreshold and is fully
+// best-effort: any read/LLM/parse failure leaves the stored profile exactly as
+// it was — consolidation must never lose a user's preferences. Silent by design
+// (like remember itself), it logs at debug for observability.
+func (a *Agent) maybeConsolidate(ctx context.Context, userID int64) {
+	log := slog.Default().With("user_id", userID)
+
+	current, err := a.store.Preferences(ctx, userID)
+	if err != nil || len(current) < consolidateThreshold {
+		return
+	}
+
+	prompt, err := json.Marshal(consolidatedProfile{Preferences: toEntries(current)})
+	if err != nil {
+		return
+	}
+	resp, err := a.llm.Chat(ctx, llm.Request{
+		Messages:  []llm.Message{llm.System(consolidateSystemPrompt), llm.User(string(prompt))},
+		MaxTokens: 800,
+	})
+	if err != nil {
+		return
+	}
+
+	desired, ok := parseConsolidated(resp.Message.Text)
+	if !ok || len(desired) == 0 || len(desired) > len(current) {
+		// Empty, unparseable, or somehow larger than the input — treat as "no
+		// safe consolidation" and leave the profile untouched.
+		log.Debug("consolidation skipped (no safe result)", "have", len(current))
+		return
+	}
+
+	a.reconcile(ctx, log, userID, current, desired)
+}
+
+// reconcile makes the stored profile equal to desired: it deletes keys that are
+// no longer present and writes every desired key (overwriting merged values).
+// Each write is independent and best-effort — a partial reconcile is still a
+// valid, smaller profile.
+func (a *Agent) reconcile(ctx context.Context, log *slog.Logger, userID int64, current, desired []store.Preference) {
+	keep := make(map[string]struct{}, len(desired))
+	for _, p := range desired {
+		keep[p.Key] = struct{}{}
+	}
+	deleted := 0
+	for _, p := range current {
+		if _, ok := keep[p.Key]; !ok {
+			if err := a.store.DeletePreference(ctx, userID, p.Key); err != nil {
+				log.Debug("consolidation delete failed", "key", p.Key, "err", err)
+				continue
+			}
+			deleted++
+		}
+	}
+	for _, p := range desired {
+		if err := a.store.SetPreference(ctx, userID, p.Key, p.Value); err != nil {
+			log.Debug("consolidation set failed", "key", p.Key, "err", err)
+		}
+	}
+	log.Info("preferences consolidated", "before", len(current), "after", len(desired), "deleted", deleted)
+}
+
+// parseConsolidated extracts the profile from the model's reply. It tolerates a
+// model that wraps the JSON in prose or a ```json fence by scanning to the outer
+// braces, then keeps only entries that pass the same key/value bounds
+// remember_preference enforces — so consolidation can never smuggle in an
+// oversized or malformed preference.
+func parseConsolidated(raw string) ([]store.Preference, bool) {
+	s := strings.TrimSpace(raw)
+	start := strings.IndexByte(s, '{')
+	end := strings.LastIndexByte(s, '}')
+	if start < 0 || end <= start {
+		return nil, false
+	}
+	var parsed consolidatedProfile
+	if err := json.Unmarshal([]byte(s[start:end+1]), &parsed); err != nil {
+		return nil, false
+	}
+	out := make([]store.Preference, 0, len(parsed.Preferences))
+	seen := make(map[string]struct{}, len(parsed.Preferences))
+	for _, e := range parsed.Preferences {
+		key := strings.Join(strings.Fields(e.Key), " ")
+		value := strings.Join(strings.Fields(e.Value), " ")
+		if key == "" || value == "" {
+			continue
+		}
+		if utf8.RuneCountInString(key) > maxPreferenceKeyLen || utf8.RuneCountInString(value) > maxPreferenceValueLen {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, store.Preference{Key: key, Value: value})
+	}
+	return out, true
+}
+
+// toEntries adapts stored preferences to the JSON entry shape the prompt uses.
+func toEntries(prefs []store.Preference) []struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+} {
+	out := make([]struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}, len(prefs))
+	for i, p := range prefs {
+		out[i].Key, out[i].Value = p.Key, p.Value
+	}
+	return out
 }

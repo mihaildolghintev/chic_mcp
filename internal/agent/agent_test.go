@@ -423,18 +423,30 @@ func TestHandle_TokenStopLoss(t *testing.T) {
 	}
 }
 
-func TestHandle_RoundLimit(t *testing.T) {
-	// The model asks for a tool every round, forever.
+// TestHandle_RoundLimitForcesAnswer: when the model wants a tool every round and
+// exhausts the round budget, the agent does one final no-tools call and returns
+// that answer — never a "couldn't assemble" message.
+func TestHandle_RoundLimitForcesAnswer(t *testing.T) {
 	loop := toolCall("list_products", `{}`, 10)
-	script := &scriptedLLM{responses: []string{loop, loop}}
+	script := &scriptedLLM{responses: []string{
+		loop, loop, // both tool rounds consumed
+		final("Вот что удалось собрать.", 10), // the forced final answer
+	}}
 	a, _ := newTestAgent(t, script, &fakeAPI{}, Options{MaxRounds: 2})
 
 	answer, err := a.Handle(context.Background(), 7, "зациклись", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answer != msgTooManyloops {
-		t.Errorf("answer = %q, want round-limit message", answer)
+	if answer != "Вот что удалось собрать." {
+		t.Errorf("answer = %q, want the forced final answer", answer)
+	}
+	if len(script.requests) != 3 {
+		t.Fatalf("want 2 tool rounds + 1 forced answer, got %d requests", len(script.requests))
+	}
+	// The forced call must advertise no tools, or the model could loop again.
+	if _, ok := script.requests[2]["tools"]; ok {
+		t.Errorf("forced final request must carry no tools, got %v", script.requests[2]["tools"])
 	}
 }
 

@@ -25,8 +25,9 @@ type fakeAPI struct {
 	srv        *httptest.Server
 	rejectHTML bool
 
-	mu   sync.Mutex
-	sent []sentMessage
+	mu     sync.Mutex
+	sent   []sentMessage
+	edited []sentMessage
 }
 
 type sentMessage struct {
@@ -42,6 +43,20 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var result any = map[string]any{}
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("editMessageText form: %v", err)
+			}
+			chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
+			f.mu.Lock()
+			f.edited = append(f.edited, sentMessage{
+				ChatID:      chatID,
+				Text:        r.FormValue("text"),
+				ParseMode:   r.FormValue("parse_mode"),
+				ReplyMarkup: r.FormValue("reply_markup"),
+			})
+			f.mu.Unlock()
+			result = map[string]any{"message_id": 1, "date": 0, "chat": map[string]any{"id": chatID}}
 		case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 			// The library posts params as multipart/form-data.
 			if err := r.ParseMultipartForm(1 << 20); err != nil {
@@ -86,6 +101,12 @@ func (f *fakeAPI) sentMessages() []sentMessage {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]sentMessage(nil), f.sent...)
+}
+
+func (f *fakeAPI) editedMessages() []sentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentMessage(nil), f.edited...)
 }
 
 func newTestBot(t *testing.T, f *fakeAPI, h Handler) *Bot {
