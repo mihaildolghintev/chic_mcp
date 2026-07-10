@@ -30,6 +30,7 @@ type fakeAPI struct {
 	documents        []moysklad.Document
 	document         *moysklad.Document
 	counterparties   []moysklad.Counterparty
+	currency         *moysklad.Currency
 
 	gotProfitDimension string
 	gotDocType         moysklad.DocumentType
@@ -83,6 +84,13 @@ func (f *fakeAPI) GetDocument(_ context.Context, _ moysklad.DocumentType, _ stri
 func (f *fakeAPI) SearchCounterparties(_ context.Context, opts moysklad.ListOptions) ([]moysklad.Counterparty, error) {
 	f.gotOpts = opts
 	return f.counterparties, f.err
+}
+
+func (f *fakeAPI) AccountCurrency(context.Context) (*moysklad.Currency, error) {
+	if f.currency != nil {
+		return f.currency, f.err
+	}
+	return &moysklad.Currency{ISOCode: "MDL", Name: "лей", Default: true}, f.err
 }
 
 func newInProcess(t *testing.T, api MoyskladAPI) *client.Client {

@@ -27,7 +27,7 @@ func registerGetDashboard(s *server.MCPServer, api MoyskladAPI) {
 			"Quick business summary for a fixed window: sales count and revenue, "+
 				"orders, and money in/out/balance, with the change versus the previous "+
 				"comparable period. Use for 'how are we doing today/this week/this month'. "+
-				"Amounts in rubles.",
+				"Amounts are in the account's base currency.",
 		),
 		mcp.WithString("period",
 			mcp.Description("One of: day, week, month. Defaults to month."),
@@ -56,7 +56,8 @@ func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
 			"Profitability report over a period, grouped by a chosen dimension. "+
 				"Answers revenue, cost, profit and margin questions and breaks them down "+
 				"by product, variant, customer, sales channel or employee. Margin is "+
-				"computed as profit/revenue. Amounts in rubles. Without dates, MoySklad "+
+				"computed as profit/revenue. Amounts are in the account's base currency. "+
+				"Without dates, MoySklad "+
 				"defaults to the previous month.",
 		),
 		mcp.WithString("group_by",
@@ -98,7 +99,7 @@ func registerGetTurnover(s *server.MCPServer, api MoyskladAPI) {
 			"Inventory turnover over a period per product: opening stock, goods in, "+
 				"goods out, closing stock, plus computed turnover days (avg stock / avg "+
 				"daily sales). Low turnover or zero outbound flags slow/dead stock. "+
-				"Amounts in rubles.",
+				"Amounts are in the account's base currency.",
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),
@@ -121,8 +122,8 @@ func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
 		mcp.WithDescription(
 			"Current warehouse stock: on-hand, reserved, available, in-transit, cost "+
 				"and sale price, stock value, and age in days (stockDays). Use for 'what's "+
-				"in stock', 'what's below minimum', 'how much money is tied up'. Amounts in "+
-				"rubles.",
+				"in stock', 'what's below minimum', 'how much money is tied up'. Amounts "+
+				"are in the account's base currency.",
 		),
 		mcp.WithString("stock_mode",
 			mcp.Description("One of: nonEmpty, all, positiveOnly, negativeOnly, underMinimum, empty. Defaults to nonEmpty."),
@@ -155,8 +156,8 @@ func registerGetCounterpartyMetrics(s *server.MCPServer, api MoyskladAPI) {
 		mcp.WithDescription(
 			"Per-customer aggregate metrics: first/last purchase date, number of "+
 				"sales, revenue, average receipt, returns, current balance (debt) and "+
-				"profit. The basis for customer analysis and segmentation. Amounts in "+
-				"rubles.",
+				"profit. The basis for customer analysis and segmentation. Amounts are in "+
+				"the account's base currency.",
 		),
 		mcp.WithBoolean("only_debtors", mcp.Description("Return only counterparties with a positive balance (owe money). Default false.")),
 		mcp.WithNumber("limit", mcp.Description("Max rows. Default 200, max 1000.")),
@@ -181,7 +182,7 @@ func registerGetMoney(s *server.MCPServer, api MoyskladAPI) {
 		mcp.WithDescription(
 			"Cash flow over a period: total money in, money out, net, and a time "+
 				"series at the chosen interval. Use for 'how much came in and went out'. "+
-				"Amounts in rubles.",
+				"Amounts are in the account's base currency.",
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),

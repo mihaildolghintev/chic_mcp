@@ -2,7 +2,7 @@ package aggregate
 
 import "mcp.chic.md/internal/moysklad"
 
-// DocumentSummary is the compact form of a document list row. Sums in rubles.
+// DocumentSummary is the compact form of a document list row. Sums in major units.
 type DocumentSummary struct {
 	ID           string  `json:"id"`
 	Name         string  `json:"name"`
@@ -21,8 +21,8 @@ func DocumentSummaryOf(d moysklad.Document) DocumentSummary {
 		ID:         d.ID,
 		Name:       d.Name,
 		Moment:     d.Moment,
-		Sum:        KopecksToRubles(d.Sum),
-		Paid:       KopecksToRubles(d.PayedSum),
+		Sum:        MinorToMajor(d.Sum),
+		Paid:       MinorToMajor(d.PayedSum),
 		Applicable: d.Applicable,
 	}
 	if d.Agent != nil {
@@ -70,12 +70,12 @@ func DocumentDetailOf(d moysklad.Document) DocumentDetail {
 	det := DocumentDetail{
 		DocumentSummary: DocumentSummaryOf(d),
 		Description:     d.Description,
-		VatSum:          KopecksToRubles(d.VatSum),
+		VatSum:          MinorToMajor(d.VatSum),
 		DueDate:         d.PaymentPlannedMoment,
 	}
 	if d.Positions != nil {
 		for _, p := range d.Positions.Rows {
-			price := KopecksToRubles(p.Price)
+			price := MinorToMajor(p.Price)
 			det.Positions = append(det.Positions, PositionRow{
 				Name:     p.Assortment.Name,
 				Code:     p.Assortment.Code,

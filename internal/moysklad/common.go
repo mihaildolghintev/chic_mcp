@@ -13,9 +13,10 @@ type NamedRef struct {
 	Code string `json:"code,omitempty"`
 }
 
-// Amount is a monetary value as MoySklad returns it: an integer number of
-// kopecks, typed float64 by the JSON decoder. Convert to rubles only in the
-// aggregation layer.
+// Amount is a monetary value as MoySklad returns it: an integer number of the
+// account currency's minor units (1/100 of the major unit — kopecks for RUB,
+// bani for MDL, cents for EUR), typed float64 by the JSON decoder. Convert to
+// major units only in the aggregation layer.
 type Amount = float64
 
 // normalizeMoment converts a "YYYY-MM-DD" or RFC3339-ish date into the format

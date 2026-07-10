@@ -28,7 +28,7 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 			"Search MoySklad documents of a given type in a date range, optionally by "+
 				"counterparty or free text. Returns compact rows (id, name, date, sum, "+
 				"paid, counterparty, state). Use to find sales, orders, supplies, invoices "+
-				"and returns, then get_document for line items. Amounts in rubles.",
+				"and returns, then get_document for line items. Amounts are in the account's base currency.",
 		),
 		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp)),
 		mcp.WithString("date_from", mcp.Description("Filter moment >= this date, YYYY-MM-DD. Optional.")),
@@ -65,7 +65,7 @@ func registerGetDocument(s *server.MCPServer, api MoyskladAPI) {
 	tool := mcp.NewTool("get_document",
 		mcp.WithDescription(
 			"Fetch one document by type and id with its line items (positions): "+
-				"product, quantity, price, discount, total. Amounts in rubles.",
+				"product, quantity, price, discount, total. Amounts are in the account's base currency.",
 		),
 		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp)),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Document UUID.")),

@@ -56,6 +56,9 @@ func (f *fakeAPI) GetDocument(context.Context, moysklad.DocumentType, string, []
 func (f *fakeAPI) SearchCounterparties(context.Context, moysklad.ListOptions) ([]moysklad.Counterparty, error) {
 	return nil, nil
 }
+func (f *fakeAPI) AccountCurrency(context.Context) (*moysklad.Currency, error) {
+	return &moysklad.Currency{ISOCode: "MDL", Name: "лей", Default: true}, nil
+}
 
 // scriptedLLM replies with each canned response in turn and records every
 // request body it saw.

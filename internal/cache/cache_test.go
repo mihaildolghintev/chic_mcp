@@ -85,6 +85,9 @@ func (c *countingSource) GetDocument(context.Context, moysklad.DocumentType, str
 func (c *countingSource) SearchCounterparties(context.Context, moysklad.ListOptions) ([]moysklad.Counterparty, error) {
 	return nil, c.err
 }
+func (c *countingSource) AccountCurrency(context.Context) (*moysklad.Currency, error) {
+	return &moysklad.Currency{ISOCode: "MDL", Name: "лей", Default: true}, c.err
+}
 
 func TestClient_MemoizesRepeatedCalls(t *testing.T) {
 	store, _ := OpenStore(":memory:")

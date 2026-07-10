@@ -32,7 +32,7 @@ func callJSON(t *testing.T, api MoyskladAPI, name string, args map[string]any, o
 	return res
 }
 
-func TestGetDashboard_ConvertsRubles(t *testing.T) {
+func TestGetDashboard_ConvertsMinorUnits(t *testing.T) {
 	api := &fakeAPI{dashboard: &moysklad.Dashboard{
 		Sales: moysklad.DashboardCount{Count: 12, Amount: 1_500_00},
 		Money: moysklad.DashboardMoney{Income: 2_000_00, Outcome: 800_00, Balance: 1_200_00},
@@ -44,7 +44,17 @@ func TestGetDashboard_ConvertsRubles(t *testing.T) {
 		t.Errorf("period = %q, want week", got.Period)
 	}
 	if got.SalesAmount != 1500 || got.MoneyIncome != 2000 || got.MoneyBalance != 1200 {
-		t.Errorf("rubles conversion wrong: %+v", got)
+		t.Errorf("minor-unit conversion wrong: %+v", got)
+	}
+}
+
+func TestGetAccountCurrency(t *testing.T) {
+	api := &fakeAPI{currency: &moysklad.Currency{ISOCode: "MDL", Name: "лей", Code: "498", Default: true}}
+	var got currencyOut
+	callJSON(t, api, "get_account_currency", nil, &got)
+
+	if got.ISOCode != "MDL" || got.Name != "лей" || got.Code != "498" {
+		t.Errorf("currency payload wrong: %+v", got)
 	}
 }
 

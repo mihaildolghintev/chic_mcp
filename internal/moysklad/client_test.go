@@ -116,6 +116,31 @@ func TestListProducts_QueryEncoding(t *testing.T) {
 	}
 }
 
+func TestAccountCurrency_PicksDefault(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/entity/currency" {
+			t.Errorf("path = %q, want /entity/currency", got)
+		}
+		if got := r.URL.Query().Get("filter"); got != "default=true" {
+			t.Errorf("filter = %q, want default=true", got)
+		}
+		// Include a non-default row to prove the picker doesn't just take [0].
+		// meta.size == len(rows) so getAll stops after this single short page.
+		w.Write([]byte(`{"meta":{"size":2},"rows":[` +
+			`{"id":"1","name":"руб.","isoCode":"RUB","code":"643","default":false},` +
+			`{"id":"2","name":"лей","isoCode":"MDL","code":"498","default":true}` +
+			`]}`))
+	})
+
+	cur, err := c.AccountCurrency(context.Background())
+	if err != nil {
+		t.Fatalf("AccountCurrency: %v", err)
+	}
+	if cur.ISOCode != "MDL" || cur.Name != "лей" || !cur.Default {
+		t.Errorf("got %+v, want the MDL default row", cur)
+	}
+}
+
 func TestDoGet_RetryOn429(t *testing.T) {
 	var calls int32
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

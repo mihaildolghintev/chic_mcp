@@ -26,6 +26,7 @@ type MoyskladAPI interface {
 	SearchDocuments(ctx context.Context, docType moysklad.DocumentType, q moysklad.DocumentQuery) ([]moysklad.Document, error)
 	GetDocument(ctx context.Context, docType moysklad.DocumentType, id string, expand []string) (*moysklad.Document, error)
 	SearchCounterparties(ctx context.Context, opts moysklad.ListOptions) ([]moysklad.Counterparty, error)
+	AccountCurrency(ctx context.Context) (*moysklad.Currency, error)
 }
 
 // toolRegistrations collects every tool's registration function. Each tool file
