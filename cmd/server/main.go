@@ -221,7 +221,7 @@ func runBot() {
 	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (string, error) {
 		// /new works the same as the inline button: forget the dialog.
 		if cmd, _, _ := strings.Cut(strings.TrimSpace(msg.Text), "@"); cmd == "/new" {
-			if err := ag.Reset(ctx, msg.Chat.ID); err != nil {
+			if err := ag.Reset(ctx, msg.From.ID); err != nil {
 				return "", fmt.Errorf("reset session: %w", err)
 			}
 			return telegram.MsgSessionReset, nil
@@ -240,7 +240,7 @@ func runBot() {
 		if text == "" && imageURI == "" {
 			return "Я понимаю текст и фотографии.", nil
 		}
-		return ag.Handle(ctx, msg.Chat.ID, text, imageURI)
+		return ag.Handle(ctx, msg.From.ID, text, imageURI)
 	})
 
 	// telegram.New calls getMe under the hood — a bad token fails fast here,

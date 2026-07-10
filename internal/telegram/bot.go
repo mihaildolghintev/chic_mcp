@@ -69,7 +69,7 @@ type Bot struct {
 	secret       string
 	allowed      map[int64]struct{}
 	handler      Handler
-	onNewSession func(ctx context.Context, chatID int64) error
+	onNewSession func(ctx context.Context, userID int64) error
 	seen         *dedupe
 	logger       *slog.Logger
 }
@@ -116,8 +116,9 @@ func New(token, webhookSecret string, allowed map[int64]struct{}, handler Handle
 func (b *Bot) API() *bot.Bot { return b.api }
 
 // OnNewSession installs the reset hook the "new dialog" button and /new
-// command trigger. Must be called before StartWebhook.
-func (b *Bot) OnNewSession(f func(ctx context.Context, chatID int64) error) { b.onNewSession = f }
+// command trigger. The hook resets one user's dialog memory. Must be called
+// before StartWebhook.
+func (b *Bot) OnNewSession(f func(ctx context.Context, userID int64) error) { b.onNewSession = f }
 
 // Me returns the bot's own account (startup logging).
 func (b *Bot) Me(ctx context.Context) (*models.User, error) {
@@ -214,12 +215,13 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 		return
 	}
 	chatID := q.Message.Message.Chat.ID
-	if err := b.onNewSession(ctx, chatID); err != nil {
+	userID := q.From.ID
+	if err := b.onNewSession(ctx, userID); err != nil {
 		log.Error("new session reset failed", "err", err)
 		b.reply(ctx, log, chatID, msgResetFailed, false)
 		return
 	}
-	log.Info("new session started", "chat_id", chatID)
+	log.Info("new session started", "user_id", userID)
 	b.reply(ctx, log, chatID, MsgSessionReset, false)
 }
 
