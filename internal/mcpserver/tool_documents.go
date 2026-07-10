@@ -26,16 +26,21 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 	tool := mcp.NewTool("search_documents",
 		mcp.WithDescription(
 			"Search MoySklad documents of a given type in a date range, optionally by "+
-				"counterparty or free text. Returns compact rows (id, name, date, sum, "+
-				"paid, counterparty, state). Use to find sales, orders, supplies, invoices "+
-				"and returns, then get_document for line items. Amounts are in the account's base currency.",
+				"counterparty or free text. Returns a `totals` object (sum and paid over "+
+				"EVERY matching document) plus the most recent documents in `rows` (id, "+
+				"name, date, sum, paid, counterparty, state). Use `totals.sum` for the "+
+				"period total — never re-sum `rows`, which may be truncated (see "+
+				"`truncated`/`rowCount`). Use to find sales, orders, supplies, invoices and "+
+				"returns, then get_document for line items. Note: a demand (sale) document "+
+				"sum includes services and does not subtract returns, so it can differ from "+
+				"get_profit revenue. Amounts are in the account's base currency.",
 		),
 		mcp.WithString("type", mcp.Required(), mcp.Description(docTypesHelp)),
 		mcp.WithString("date_from", mcp.Description("Filter moment >= this date, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Filter moment <= this date, YYYY-MM-DD. Optional.")),
 		mcp.WithString("counterparty_id", mcp.Description("Filter by counterparty UUID. Optional.")),
 		mcp.WithString("search", mcp.Description("Free-text search over document name/description. Optional.")),
-		mcp.WithNumber("limit", mcp.Description("Max rows. Default 100, max 1000.")),
+		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 100, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		docType := req.GetString("type", "")
@@ -43,19 +48,20 @@ func registerSearchDocuments(s *server.MCPServer, api MoyskladAPI) {
 			return mcp.NewToolResultError("invalid document type. " + docTypesHelp), nil
 		}
 		from, to := dateArgs(req)
+		display := clampLimit(req.GetInt("limit", 100))
+		// Limit 0 fetches every matching document so totals cover the whole period.
 		q := moysklad.DocumentQuery{
 			From:           from,
 			To:             to,
 			CounterpartyID: req.GetString("counterparty_id", ""),
 			Search:         req.GetString("search", ""),
-			Limit:          clampLimit(req.GetInt("limit", 100)),
 			Order:          "moment,desc",
 		}
 		docs, err := api.SearchDocuments(ctx, moysklad.DocumentType(docType), q)
 		if err != nil {
 			return resultOrError[any](nil, err)
 		}
-		return resultOrError(aggregate.DocumentSummaries(docs), nil)
+		return resultOrError(aggregate.DocumentReport(docs, display), nil)
 	})
 }
 

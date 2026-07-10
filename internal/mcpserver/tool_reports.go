@@ -57,19 +57,26 @@ func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
 				"Answers revenue, cost, profit and margin questions and breaks them down "+
 				"by product, variant, customer, sales channel or employee. Margin is "+
 				"computed as profit/revenue. Amounts are in the account's base currency. "+
-				"Without dates, MoySklad "+
-				"defaults to the previous month.",
+				"Without dates, MoySklad defaults to the previous month.\n\n"+
+				"Returns a `totals` object (revenue, cost, profit, margin) computed over "+
+				"EVERY matching row, plus the top rows by revenue in `rows`. Use `totals` "+
+				"for period sums — never re-sum `rows`, which may be truncated (see "+
+				"`truncated`/`rowCount`). Revenue here equals MoySklad's Profitability "+
+				"report (shipments minus returns); it is NOT the sum of shipment document "+
+				"totals, which include services and do not subtract returns.",
 		),
 		mcp.WithString("group_by",
 			mcp.Description("One of: product, variant, counterparty, saleschannel, employee. Defaults to product."),
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),
-		mcp.WithNumber("limit", mcp.Description("Max rows. Default 100, max 1000.")),
+		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 100, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		from, to := dateArgs(req)
-		opts := moysklad.ProfitOptions{From: from, To: to, Limit: clampLimit(req.GetInt("limit", 100))}
+		// Fetch every row (Limit 0) so totals are complete; limit only caps detail.
+		opts := moysklad.ProfitOptions{From: from, To: to}
+		display := clampLimit(req.GetInt("limit", 100))
 		groupBy := req.GetString("group_by", "product")
 
 		switch groupBy {
@@ -78,13 +85,13 @@ func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
 			if err != nil {
 				return resultOrError[any](nil, err)
 			}
-			return resultOrError(aggregate.ProfitByProduct(rows), nil)
+			return resultOrError(aggregate.ProfitProductReport(rows, display), nil)
 		case "counterparty", "saleschannel", "employee":
 			rows, err := api.ProfitByEntity(ctx, groupBy, opts)
 			if err != nil {
 				return resultOrError[any](nil, err)
 			}
-			return resultOrError(aggregate.ProfitByEntity(rows), nil)
+			return resultOrError(aggregate.ProfitEntityReport(rows, display), nil)
 		default:
 			return mcp.NewToolResultError("group_by must be one of: product, variant, counterparty, saleschannel, employee"), nil
 		}
@@ -103,15 +110,16 @@ func registerGetTurnover(s *server.MCPServer, api MoyskladAPI) {
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),
-		mcp.WithNumber("limit", mcp.Description("Max rows. Default 200, max 1000.")),
+		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 200, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		from, to := dateArgs(req)
-		rows, err := api.GetTurnover(ctx, moysklad.ProfitOptions{From: from, To: to, Limit: clampLimit(req.GetInt("limit", 200))})
+		display := clampLimit(req.GetInt("limit", 200))
+		rows, err := api.GetTurnover(ctx, moysklad.ProfitOptions{From: from, To: to})
 		if err != nil {
 			return resultOrError[any](nil, err)
 		}
-		return resultOrError(aggregate.Turnover(rows, periodDays(from, to, 30)), nil)
+		return resultOrError(aggregate.TurnoverReport(rows, periodDays(from, to, 30), display), nil)
 	})
 }
 
@@ -128,7 +136,7 @@ func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
 		mcp.WithString("stock_mode",
 			mcp.Description("One of: nonEmpty, all, positiveOnly, negativeOnly, underMinimum, empty. Defaults to nonEmpty."),
 		),
-		mcp.WithNumber("limit", mcp.Description("Max rows. Default 200, max 1000.")),
+		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 200, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		mode := req.GetString("stock_mode", "nonEmpty")
@@ -137,15 +145,15 @@ func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
 		default:
 			mode = "nonEmpty"
 		}
+		display := clampLimit(req.GetInt("limit", 200))
 		rows, err := api.GetStock(ctx, moysklad.StockOptions{
 			StockMode: mode,
 			GroupBy:   "product",
-			Limit:     clampLimit(req.GetInt("limit", 200)),
 		})
 		if err != nil {
 			return resultOrError[any](nil, err)
 		}
-		return resultOrError(aggregate.Stock(rows), nil)
+		return resultOrError(aggregate.StockReport(rows, display), nil)
 	})
 }
 
@@ -160,18 +168,19 @@ func registerGetCounterpartyMetrics(s *server.MCPServer, api MoyskladAPI) {
 				"the account's base currency.",
 		),
 		mcp.WithBoolean("only_debtors", mcp.Description("Return only counterparties with a positive balance (owe money). Default false.")),
-		mcp.WithNumber("limit", mcp.Description("Max rows. Default 200, max 1000.")),
+		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 200, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var filter []string
 		if req.GetBool("only_debtors", false) {
 			filter = append(filter, "balance>0")
 		}
-		rows, err := api.GetCounterpartyReport(ctx, filter, clampLimit(req.GetInt("limit", 200)))
+		display := clampLimit(req.GetInt("limit", 200))
+		rows, err := api.GetCounterpartyReport(ctx, filter, 0)
 		if err != nil {
 			return resultOrError[any](nil, err)
 		}
-		return resultOrError(aggregate.CounterpartyMetrics(rows), nil)
+		return resultOrError(aggregate.CounterpartyReport(rows, display), nil)
 	})
 }
 
