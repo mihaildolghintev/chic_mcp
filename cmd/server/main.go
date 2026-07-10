@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -135,6 +136,34 @@ func resolveCurrency(ctx context.Context, api mcpserver.MoyskladAPI) (code, name
 	return cur.ISOCode, cur.Name
 }
 
+// mcpTokenMinLen is the minimum accepted length for MCP_BEARER_TOKEN — short
+// enough to allow any real random token, long enough to reject a typo/weak
+// value that would expose the whole read surface.
+const mcpTokenMinLen = 24
+
+// bearerAuth guards next with a constant-time token check. The "Bearer" scheme
+// is matched case-insensitively (RFC 6750), the token constant-time. A missing
+// or wrong credential yields 401 and never reaches the MCP handler.
+func bearerAuth(token string, next http.Handler) http.Handler {
+	want := []byte(token)
+	const prefix = "bearer "
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		got := []byte(auth[len(prefix):])
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // runBot is the production mode: Telegram webhook + worker pool + /healthz,
 // with the MCP-backed LLM agent answering messages.
 func runBot() {
@@ -246,6 +275,21 @@ func runBot() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	})
+
+	// Optionally expose the MoySklad MCP surface to remote clients (Claude,
+	// Antigravity) at /mcp. Opt-in and never anonymous: it is mounted only when
+	// MCP_BEARER_TOKEN is set, and every request must present that token as a
+	// Bearer credential. Without the env var the endpoint does not exist.
+	if mcpToken := os.Getenv("MCP_BEARER_TOKEN"); mcpToken != "" {
+		if len(mcpToken) < mcpTokenMinLen {
+			slog.Error("MCP_BEARER_TOKEN too short — refusing to expose the MCP endpoint with a weak token", "min", mcpTokenMinLen)
+			os.Exit(1)
+		}
+		mux.Handle("/mcp", bearerAuth(mcpToken, mcpserver.NewStreamableHTTP(api)))
+		slog.Info("public MCP endpoint enabled", "path", "/mcp", "auth", "bearer")
+	} else {
+		slog.Info("public MCP endpoint disabled (set MCP_BEARER_TOKEN to enable)")
+	}
 
 	srv := &http.Server{
 		Addr:              addr,

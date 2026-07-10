@@ -42,12 +42,29 @@ func normalizeMoment(s string) string {
 	return s + " 00:00:00"
 }
 
-// setMoment adds momentFrom/momentTo to a query if non-empty.
+// normalizeMomentEnd is normalizeMoment for the *end* of an inclusive range: a
+// bare "YYYY-MM-DD" is stretched to the last second of that day so momentTo
+// covers the whole final day (МойСклад's momentTo is inclusive of the instant).
+// A value that already carries a time component is passed through unchanged.
+func normalizeMomentEnd(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, " ") || strings.ContainsRune(s, 'T') {
+		return normalizeMoment(s)
+	}
+	return s + " 23:59:59"
+}
+
+// setPeriod adds momentFrom/momentTo to a query if non-empty. A bare end date is
+// treated as inclusive (end of day) so "2026-07-01".."2026-07-10" covers all of
+// the 10th.
 func setPeriod(v url.Values, from, to string) {
 	if m := normalizeMoment(from); m != "" {
 		v.Set("momentFrom", m)
 	}
-	if m := normalizeMoment(to); m != "" {
+	if m := normalizeMomentEnd(to); m != "" {
 		v.Set("momentTo", m)
 	}
 }

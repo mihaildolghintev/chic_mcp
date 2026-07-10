@@ -121,15 +121,15 @@ func TestSegmentCounterparties_EndToEnd(t *testing.T) {
 		{Counterparty: moysklad.NamedRef{Name: "Debtor"}, Balance: 5_000_00, DemandsSum: 1_000_00},
 	}}
 	var got struct {
-		Items []aggregate.CounterpartySegment `json:"items"`
+		Rows []aggregate.CounterpartySegment `json:"rows"`
 	}
 	callJSON(t, api, "segment_counterparties", map[string]any{}, &got)
 
-	if len(got.Items) != 1 {
-		t.Fatalf("got %d segments, want 1", len(got.Items))
+	if len(got.Rows) != 1 {
+		t.Fatalf("got %d segments, want 1", len(got.Rows))
 	}
-	if !contains(got.Items[0].Segments, "debtor") {
-		t.Errorf("segments = %v, want debtor", got.Items[0].Segments)
+	if !contains(got.Rows[0].Segments, "debtor") {
+		t.Errorf("segments = %v, want debtor", got.Rows[0].Segments)
 	}
 }
 

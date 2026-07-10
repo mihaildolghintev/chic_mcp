@@ -22,17 +22,71 @@ const (
 	DocPurchaseReturn DocumentType = "purchasereturn" // возврат поставщику
 	DocPaymentIn      DocumentType = "paymentin"      // входящий платёж
 	DocPaymentOut     DocumentType = "paymentout"     // исходящий платёж
+	DocMove           DocumentType = "move"           // перемещение между складами
+	DocInventory      DocumentType = "inventory"      // инвентаризация
+	DocLoss           DocumentType = "loss"           // списание
+	DocEnter          DocumentType = "enter"          // оприходование
+	DocProcessing     DocumentType = "processing"     // техоперация
 )
+
+// docTypeInfo is the single source of truth for every supported document type:
+// its order drives the enum shown to clients, and hasCurrency gates the
+// rate.currency expand. Adding a type is one line here — ValidDocumentType,
+// HasCurrency and DocumentTypeStrings all derive from it.
+type docTypeInfo struct {
+	Type        DocumentType
+	HasCurrency bool // commercial docs carry a currency; warehouse ops do not
+}
+
+var documentTypes = []docTypeInfo{
+	{DocDemand, true},
+	{DocCustomerOrder, true},
+	{DocSupply, true},
+	{DocPurchaseOrder, true},
+	{DocInvoiceOut, true},
+	{DocInvoiceIn, true},
+	{DocSalesReturn, true},
+	{DocPurchaseReturn, true},
+	{DocPaymentIn, true},
+	{DocPaymentOut, true},
+	{DocMove, false},
+	{DocInventory, false},
+	{DocLoss, false},
+	{DocEnter, false},
+	{DocProcessing, false},
+}
+
+// HasCurrency reports whether a document type carries a currency/rate. Only the
+// commercial documents do; the warehouse operations (move, enter, loss,
+// inventory, processing) are always in the base currency and reject a
+// rate.currency expand, so callers must not request it for them.
+func HasCurrency(t DocumentType) bool {
+	for _, d := range documentTypes {
+		if d.Type == t {
+			return d.HasCurrency
+		}
+	}
+	return false
+}
 
 // ValidDocumentType reports whether s is a supported document type.
 func ValidDocumentType(s string) bool {
-	switch DocumentType(s) {
-	case DocDemand, DocCustomerOrder, DocSupply, DocPurchaseOrder,
-		DocInvoiceOut, DocInvoiceIn, DocSalesReturn, DocPurchaseReturn,
-		DocPaymentIn, DocPaymentOut:
-		return true
+	for _, d := range documentTypes {
+		if string(d.Type) == s {
+			return true
+		}
 	}
 	return false
+}
+
+// DocumentTypeStrings returns every supported document type in display order,
+// for building a JSON-schema enum.
+func DocumentTypeStrings() []string {
+	out := make([]string, len(documentTypes))
+	for i, d := range documentTypes {
+		out[i] = string(d.Type)
+	}
+	return out
 }
 
 // Document is a trimmed view over the common fields of MoySklad documents.
@@ -57,7 +111,19 @@ type Document struct {
 	Store                 *NamedRef               `json:"store,omitempty"`
 	SalesChannel          *NamedRef               `json:"salesChannel,omitempty"`
 	State                 *NamedRef               `json:"state,omitempty"`
+	Rate                  *Rate                   `json:"rate,omitempty"`
 	Positions             *ListResponse[Position] `json:"positions,omitempty"`
+}
+
+// Rate is a document's currency and exchange rate. Sum/payedSum and position
+// prices are stored in the DOCUMENT's currency minor units, not the account's
+// base currency — Currency (once expanded via rate.currency) is what labels
+// them honestly. Value is МойСклад's raw rate figure; base-currency conversion
+// is intentionally left to the caller because its direction depends on the
+// currency's indirect flag.
+type Rate struct {
+	Value    float64   `json:"value,omitempty"`
+	Currency *Currency `json:"currency,omitempty"`
 }
 
 // Position is a document line. Price and Sum are in kopecks; Discount is a
@@ -90,7 +156,7 @@ func (q DocumentQuery) values(baseURL string) url.Values {
 	if m := normalizeMoment(q.From); m != "" {
 		filters = append(filters, "moment>="+m)
 	}
-	if m := normalizeMoment(q.To); m != "" {
+	if m := normalizeMomentEnd(q.To); m != "" {
 		filters = append(filters, "moment<="+m)
 	}
 	if q.CounterpartyID != "" {

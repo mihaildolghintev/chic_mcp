@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -22,7 +23,7 @@ func init() {
 // ---- get_dashboard --------------------------------------------------------
 
 func registerGetDashboard(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_dashboard",
+	tool := newTool("get_dashboard",
 		mcp.WithDescription(
 			"Quick business summary for a fixed window: sales count and revenue, "+
 				"orders, and money in/out/balance, with the change versus the previous "+
@@ -31,6 +32,8 @@ func registerGetDashboard(s *server.MCPServer, api MoyskladAPI) {
 		),
 		mcp.WithString("period",
 			mcp.Description("One of: day, week, month. Defaults to month."),
+			mcp.Enum("day", "week", "month"),
+			mcp.DefaultString("month"),
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -51,7 +54,7 @@ func registerGetDashboard(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_profit -----------------------------------------------------------
 
 func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_profit",
+	tool := newTool("get_profit",
 		mcp.WithDescription(
 			"Profitability report over a period, grouped by a chosen dimension. "+
 				"Answers revenue, cost, profit and margin questions and breaks them down "+
@@ -67,6 +70,8 @@ func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
 		),
 		mcp.WithString("group_by",
 			mcp.Description("One of: product, variant, counterparty, saleschannel, employee. Defaults to product."),
+			mcp.Enum("product", "variant", "counterparty", "saleschannel", "employee"),
+			mcp.DefaultString("product"),
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),
@@ -101,7 +106,7 @@ func registerGetProfit(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_turnover ---------------------------------------------------------
 
 func registerGetTurnover(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_turnover",
+	tool := newTool("get_turnover",
 		mcp.WithDescription(
 			"Inventory turnover over a period per product: opening stock, goods in, "+
 				"goods out, closing stock, plus computed turnover days (avg stock / avg "+
@@ -114,6 +119,11 @@ func registerGetTurnover(s *server.MCPServer, api MoyskladAPI) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		from, to := dateArgs(req)
+		// Pin the no-date default to the previous full month so the turnover-days
+		// denominator matches the exact window the data covers.
+		if from == "" && to == "" {
+			from, to = prevMonth(time.Now())
+		}
 		display := clampLimit(req.GetInt("limit", 200))
 		rows, err := api.GetTurnover(ctx, moysklad.ProfitOptions{From: from, To: to})
 		if err != nil {
@@ -126,16 +136,22 @@ func registerGetTurnover(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_stock ------------------------------------------------------------
 
 func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_stock",
+	tool := newTool("get_stock",
 		mcp.WithDescription(
-			"Current warehouse stock: on-hand, reserved, available, in-transit, cost "+
+			"Warehouse stock: on-hand, reserved, available, in-transit, cost "+
 				"and sale price, stock value, and age in days (stockDays). Use for 'what's "+
-				"in stock', 'what's below minimum', 'how much money is tied up'. Amounts "+
-				"are in the account's base currency.",
+				"in stock', 'what's below minimum', 'how much money is tied up'. Defaults to "+
+				"the current snapshot across all warehouses; pass `date` for the stock as of "+
+				"a past date, or `store` to scope to one warehouse. Amounts are in the "+
+				"account's base currency.",
 		),
 		mcp.WithString("stock_mode",
 			mcp.Description("One of: nonEmpty, all, positiveOnly, negativeOnly, underMinimum, empty. Defaults to nonEmpty."),
+			mcp.Enum("nonEmpty", "all", "positiveOnly", "negativeOnly", "underMinimum", "empty"),
+			mcp.DefaultString("nonEmpty"),
 		),
+		mcp.WithString("date", mcp.Description("Stock as of this date, YYYY-MM-DD. Optional (default: now).")),
+		mcp.WithString("store", mcp.Description("Warehouse UUID to scope the report to a single store. Optional.")),
 		mcp.WithNumber("limit", mcp.Description("Max detail rows to return. Does NOT affect totals. Default 200, max 1000.")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -149,6 +165,8 @@ func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
 		rows, err := api.GetStock(ctx, moysklad.StockOptions{
 			StockMode: mode,
 			GroupBy:   "product",
+			Moment:    req.GetString("date", ""),
+			StoreID:   req.GetString("store", ""),
 		})
 		if err != nil {
 			return resultOrError[any](nil, err)
@@ -160,7 +178,7 @@ func registerGetStock(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_counterparty_metrics --------------------------------------------
 
 func registerGetCounterpartyMetrics(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_counterparty_metrics",
+	tool := newTool("get_counterparty_metrics",
 		mcp.WithDescription(
 			"Per-customer aggregate metrics: first/last purchase date, number of "+
 				"sales, revenue, average receipt, returns, current balance (debt) and "+
@@ -187,7 +205,7 @@ func registerGetCounterpartyMetrics(s *server.MCPServer, api MoyskladAPI) {
 // ---- get_money ------------------------------------------------------------
 
 func registerGetMoney(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_money",
+	tool := newTool("get_money",
 		mcp.WithDescription(
 			"Cash flow over a period: total money in, money out, net, and a time "+
 				"series at the chosen interval. Use for 'how much came in and went out'. "+
@@ -195,7 +213,11 @@ func registerGetMoney(s *server.MCPServer, api MoyskladAPI) {
 		),
 		mcp.WithString("date_from", mcp.Description("Period start, YYYY-MM-DD. Optional.")),
 		mcp.WithString("date_to", mcp.Description("Period end, YYYY-MM-DD. Optional.")),
-		mcp.WithString("interval", mcp.Description("One of: hour, day, month. Defaults to day.")),
+		mcp.WithString("interval",
+			mcp.Description("One of: hour, day, month. Defaults to day."),
+			mcp.Enum("hour", "day", "month"),
+			mcp.DefaultString("day"),
+		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		from, to := dateArgs(req)

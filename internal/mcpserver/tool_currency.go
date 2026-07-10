@@ -23,7 +23,7 @@ type currencyOut struct {
 // ---- get_account_currency -------------------------------------------------
 
 func registerGetAccountCurrency(s *server.MCPServer, api MoyskladAPI) {
-	tool := mcp.NewTool("get_account_currency",
+	tool := newTool("get_account_currency",
 		mcp.WithDescription(
 			"The account's base (accounting) currency — the one every amount from the "+
 				"other tools (dashboard, profit, stock, money, documents, prices) is "+
