@@ -19,16 +19,20 @@ import (
 )
 
 // fakeAPI is a stub Telegram Bot API server recording sendMessage calls.
+// With rejectHTML set it answers any HTML-mode sendMessage with the 400 a
+// real parse failure produces, to exercise the plain-text fallback.
 type fakeAPI struct {
-	srv *httptest.Server
+	srv        *httptest.Server
+	rejectHTML bool
 
 	mu   sync.Mutex
 	sent []sentMessage
 }
 
 type sentMessage struct {
-	ChatID int64  `json:"chat_id"`
-	Text   string `json:"text"`
+	ChatID    int64  `json:"chat_id"`
+	Text      string `json:"text"`
+	ParseMode string `json:"parse_mode"`
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -46,10 +50,19 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 			if err != nil {
 				t.Errorf("sendMessage chat_id: %v", err)
 			}
-			m := sentMessage{ChatID: chatID, Text: r.FormValue("text")}
+			m := sentMessage{ChatID: chatID, Text: r.FormValue("text"), ParseMode: r.FormValue("parse_mode")}
 			f.mu.Lock()
 			f.sent = append(f.sent, m)
 			f.mu.Unlock()
+			if f.rejectHTML && m.ParseMode == "HTML" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ok": false, "error_code": 400,
+					"description": "Bad Request: can't parse entities",
+				})
+				return
+			}
 			result = map[string]any{"message_id": 1, "date": 0, "chat": map[string]any{"id": m.ChatID}}
 		case strings.HasSuffix(r.URL.Path, "/setWebhook"):
 			result = true
@@ -104,6 +117,46 @@ func TestAllowedUserGetsEcho(t *testing.T) {
 	sent := f.sentMessages()
 	if len(sent) != 1 || sent[0].Text != "привет" || sent[0].ChatID != 100 {
 		t.Fatalf("want echo to chat 100, got %+v", sent)
+	}
+}
+
+// TestReplySanitizesAndSendsHTML: replies go out with ParseMode=HTML, allowed
+// tags intact and everything else escaped so Telegram can't reject the parse.
+func TestReplySanitizesAndSendsHTML(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
+		return "<b>итог</b>: 1 < 2 <script>x</script>", nil
+	}))
+
+	process(b, update(1, 100, "отчёт"))
+
+	sent := f.sentMessages()
+	want := "<b>итог</b>: 1 &lt; 2 &lt;script&gt;x&lt;/script&gt;"
+	if len(sent) != 1 || sent[0].Text != want || sent[0].ParseMode != "HTML" {
+		t.Fatalf("want sanitized HTML reply %q, got %+v", want, sent)
+	}
+}
+
+// TestHTMLRejectFallsBackToPlainText: if Telegram still answers 400 to the
+// HTML send, the same chunk is resent without ParseMode and without tags.
+func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
+	f := newFakeAPI(t)
+	f.rejectHTML = true
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
+		return "<b>жирный</b> текст", nil
+	}))
+
+	process(b, update(1, 100, "отчёт"))
+
+	sent := f.sentMessages()
+	if len(sent) != 2 {
+		t.Fatalf("want HTML attempt + plain retry, got %+v", sent)
+	}
+	if sent[0].ParseMode != "HTML" {
+		t.Errorf("first send must be HTML, got %+v", sent[0])
+	}
+	if sent[1].ParseMode != "" || sent[1].Text != "жирный текст" {
+		t.Errorf("retry must be plain text without tags, got %+v", sent[1])
 	}
 }
 
