@@ -38,7 +38,7 @@ type Options struct {
 	MaxRounds    int           // LLM⇄tools round trips per request (default 6)
 	MaxTokens    int           // cumulative token stop-loss per request (default 200k)
 	HistoryDepth int           // dialog turns replayed from the store (default 20)
-	RatePerHour  int           // per-chat requests per hour, 0 = default 30, <0 = unlimited
+	RatePerHour  int           // per-user requests per hour, 0 = default 30, <0 = unlimited
 	Timeout      time.Duration // wall-clock cap per request (default 3m)
 
 	// CurrencyCode and CurrencyName label monetary amounts in the system
@@ -104,6 +104,10 @@ func New(ctx context.Context, llmClient *llm.Client, srv *server.MCPServer, st s
 	if err != nil {
 		return nil, err
 	}
+	// Memory tools are agent-local, not part of the public MoySklad MCP
+	// surface: they mutate per-user state the MCP server has no notion of, so
+	// the dispatch loop handles them against the store with the live user id.
+	tools = append(tools, memoryTools...)
 	slog.Info("agent ready", "tools", len(tools))
 
 	return &Agent{
@@ -119,10 +123,12 @@ func New(ctx context.Context, llmClient *llm.Client, srv *server.MCPServer, st s
 // Close tears down the MCP session.
 func (a *Agent) Close() error { return a.mcp.Close() }
 
-// Reset starts a fresh dialog session for chatID: the next answer won't see
-// anything said before this point. Old messages stay stored.
-func (a *Agent) Reset(ctx context.Context, chatID int64) error {
-	return a.store.StartSession(ctx, chatID)
+// Reset starts a fresh dialog session for userID: the next answer won't see
+// anything said before this point. Old messages stay stored, and durable
+// preferences (language, style, …) are untouched — /new forgets the
+// conversation, not the person.
+func (a *Agent) Reset(ctx context.Context, userID int64) error {
+	return a.store.StartSession(ctx, userID)
 }
 
 // convertTools turns MCP tool schemas into OpenAI function definitions — the
@@ -146,11 +152,12 @@ func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
 	return out, nil
 }
 
-// Handle answers one user message. text is the message text (or the photo
-// caption), imageDataURI is a base64 data URI when the message carries a
-// photo. The returned string is always safe to send to the user.
-func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI string) (string, error) {
-	if !a.allow(chatID) {
+// Handle answers one user message. userID identifies the Telegram user (the
+// key for both dialog history and durable memory); text is the message text
+// (or the photo caption), imageDataURI is a base64 data URI when the message
+// carries a photo. The returned string is always safe to send to the user.
+func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI string) (string, error) {
+	if !a.allow(userID) {
 		return msgRateLimited, nil
 	}
 	if imageDataURI != "" && !a.llm.HasVision() {
@@ -159,13 +166,17 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 	ctx, cancel := context.WithTimeout(ctx, a.opts.Timeout)
 	defer cancel()
 
-	log := slog.Default().With("chat_id", chatID)
+	log := slog.Default().With("user_id", userID)
 
-	// History is context, not correctness — a read failure degrades to a
+	// Both reads are context, not correctness — a failure degrades to a
 	// memoryless answer instead of an error.
-	history, err := a.store.RecentMessages(ctx, chatID, a.opts.HistoryDepth)
+	history, err := a.store.RecentMessages(ctx, userID, a.opts.HistoryDepth)
 	if err != nil {
 		log.Warn("history read failed, answering without it", "err", err)
+	}
+	prefs, err := a.store.Preferences(ctx, userID)
+	if err != nil {
+		log.Warn("preferences read failed, answering without them", "err", err)
 	}
 
 	userMsg := llm.User(text)
@@ -176,7 +187,7 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 	}
 
 	msgs := make([]llm.Message, 0, len(history)+2)
-	msgs = append(msgs, llm.System(systemPrompt(time.Now(), a.opts.CurrencyCode, a.opts.CurrencyName)))
+	msgs = append(msgs, llm.System(systemPrompt(time.Now(), a.opts.CurrencyCode, a.opts.CurrencyName, prefs)))
 	for _, h := range history {
 		msgs = append(msgs, llm.Message{Role: h.Role, Text: h.Content})
 	}
@@ -196,7 +207,7 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 
 		if len(resp.Message.ToolCalls) == 0 {
 			answer := strings.TrimSpace(resp.Message.Text)
-			a.remember(ctx, log, chatID, stored, answer)
+			a.remember(ctx, log, userID, stored, answer)
 			log.Info("agent answered", "rounds", round+1, "tokens", spent, "provider", resp.Provider)
 			return answer, nil
 		}
@@ -210,7 +221,7 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 
 		for _, tc := range resp.Message.ToolCalls {
 			started := time.Now()
-			result := a.callTool(ctx, tc)
+			result := a.dispatchTool(ctx, userID, tc)
 			log.Info("tool called", "tool", tc.Function.Name, "took", time.Since(started).Round(time.Millisecond))
 			msgs = append(msgs, llm.ToolResult(tc.ID, result))
 		}
@@ -218,6 +229,18 @@ func (a *Agent) Handle(ctx context.Context, chatID int64, text, imageDataURI str
 
 	log.Warn("agent hit round limit", "rounds", a.opts.MaxRounds, "tokens", spent)
 	return msgTooManyloops, nil
+}
+
+// dispatchTool routes one tool call. Memory tools are handled locally against
+// the store (they need the live user id and mutate state the MCP server does
+// not own); everything else goes to the in-process MoySklad MCP server.
+func (a *Agent) dispatchTool(ctx context.Context, userID int64, tc llm.ToolCall) string {
+	switch tc.Function.Name {
+	case toolRememberPreference, toolForgetPreference:
+		return a.callMemoryTool(ctx, userID, tc)
+	default:
+		return a.callTool(ctx, tc)
+	}
 }
 
 // callTool executes one MCP tool call. Failures come back as text for the
@@ -266,31 +289,31 @@ func truncate(s string, n int) string {
 }
 
 // remember persists the exchange; history is best-effort by design.
-func (a *Agent) remember(ctx context.Context, log *slog.Logger, chatID int64, userText, answer string) {
+func (a *Agent) remember(ctx context.Context, log *slog.Logger, userID int64, userText, answer string) {
 	if userText != "" {
-		if err := a.store.AppendMessage(ctx, chatID, "user", userText); err != nil {
+		if err := a.store.AppendMessage(ctx, userID, "user", userText); err != nil {
 			log.Warn("store user message failed", "err", err)
 		}
 	}
 	if answer != "" {
-		if err := a.store.AppendMessage(ctx, chatID, "assistant", answer); err != nil {
+		if err := a.store.AppendMessage(ctx, userID, "assistant", answer); err != nil {
 			log.Warn("store assistant message failed", "err", err)
 		}
 	}
 }
 
-// allow enforces the per-chat hourly rate limit.
-func (a *Agent) allow(chatID int64) bool {
+// allow enforces the per-user hourly rate limit.
+func (a *Agent) allow(userID int64) bool {
 	if a.opts.RatePerHour < 0 {
 		return true
 	}
 	a.mu.Lock()
-	lim, ok := a.limiters[chatID]
+	lim, ok := a.limiters[userID]
 	if !ok {
 		// Full-burst limiter: RatePerHour requests immediately, then a steady
 		// refill — matches "N запросов в час" the way a human expects it.
 		lim = rate.NewLimiter(rate.Every(time.Hour/time.Duration(a.opts.RatePerHour)), a.opts.RatePerHour)
-		a.limiters[chatID] = lim
+		a.limiters[userID] = lim
 	}
 	a.mu.Unlock()
 	return lim.Allow()
@@ -298,8 +321,10 @@ func (a *Agent) allow(chatID int64) bool {
 
 // systemPrompt is rebuilt per request so "сегодня" is always today. currencyCode
 // and currencyName label monetary amounts; empty falls back to a neutral hint,
-// since the account's currency must never be assumed to be rubles.
-func systemPrompt(now time.Time, currencyCode, currencyName string) string {
+// since the account's currency must never be assumed to be rubles. prefs are the
+// user's durable preferences, rendered into the prompt so the model honours them
+// across sessions without re-asking.
+func systemPrompt(now time.Time, currencyCode, currencyName string, prefs []store.Preference) string {
 	return fmt.Sprintf(`Ты — ассистент по данным МойСклад магазина Chic. Сегодня %s.
 
 У тебя есть инструменты только для ЧТЕНИЯ данных МойСклад: товары, остатки,
@@ -307,7 +332,8 @@ func systemPrompt(now time.Time, currencyCode, currencyName string) string {
 (ABC-анализ, сравнение периодов, мёртвый сток, дебиторка).
 
 Правила:
-- Отвечай на русском, кратко и по делу. %s
+- Отвечай кратко и по делу на русском — если в «Предпочтениях» ниже не указан
+  другой язык общения. %s
 - Данные бери только из инструментов, ничего не выдумывай.
 - Если вопрос про период ("за неделю", "в марте") — вычисли даты от сегодняшней.
 - Если вопрос неоднозначный, задай короткий уточняющий вопрос вместо догадок.
@@ -318,6 +344,15 @@ func systemPrompt(now time.Time, currencyCode, currencyName string) string {
   документов «Отгрузка» (search_documents demand) включает услуги и не вычитает
   возвраты — поэтому цифры законно различаются, не выдумывай других причин.
 
+Память о пользователе:
+- Когда пользователь выражает УСТОЙЧИВОЕ пожелание (язык общения, стиль и формат
+  ответов, специфику бизнеса — напр. основной склад) — сохрани его вызовом
+  remember_preference со СТАБИЛЬНЫМ ключом на латинице (language, reply_style,
+  main_warehouse и т.п.). Не сохраняй разовые вопросы и сами данные из отчётов.
+- Если пожелание изменилось — перезапиши тем же ключом; если отменено — удали
+  через forget_preference. Не переспрашивай то, что уже есть в «Предпочтениях».
+- Сохранение — молча, не сообщай о нём отдельным предложением.
+%s
 Формат: пиши обычным Markdown — он отображается в Telegram.
 - Разметка: **жирный**, *курсив*, `+"`моноширинный`"+`, > цитата, списки «- пункт»,
   ссылки [текст](url). Заголовок «# …» станет жирной строкой.
@@ -329,7 +364,22 @@ func systemPrompt(now time.Time, currencyCode, currencyName string) string {
   помести в цитату «> …» — длинная цитата в Telegram сворачивается.
 - Артикулы, коды и номера документов оборачивай в `+"`моноширинный`"+`.
 - Держи строки короткими: ответ читают с телефона.`,
-		now.Format("2006-01-02 (Monday)"), moneyRule(currencyCode, currencyName))
+		now.Format("2006-01-02 (Monday)"), moneyRule(currencyCode, currencyName), renderProfile(prefs))
+}
+
+// renderProfile turns stored preferences into a prompt block the model reads as
+// established facts about the user. Empty preferences render to an empty string
+// so a new user's prompt carries no dangling "Предпочтения" header.
+func renderProfile(prefs []store.Preference) string {
+	if len(prefs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nПредпочтения пользователя (уже известны, соблюдай их):\n")
+	for _, p := range prefs {
+		fmt.Fprintf(&b, "- %s: %s\n", p.Key, p.Value)
+	}
+	return b.String()
 }
 
 // moneyRule builds the currency-formatting line of the system prompt from the
