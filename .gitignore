@@ -15,5 +15,8 @@
 *.db-wal
 /data/
 
+# Coverage output from `make ci` / `go test -coverprofile`
+coverage.out
+
 # OS / editor
 .DS_Store

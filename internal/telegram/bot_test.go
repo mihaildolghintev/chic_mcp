@@ -128,12 +128,13 @@ func TestAllowedUserGetsEcho(t *testing.T) {
 	}
 }
 
-// TestReplySanitizesAndSendsHTML: replies go out with ParseMode=HTML, allowed
-// tags intact and everything else escaped so Telegram can't reject the parse.
-func TestReplySanitizesAndSendsHTML(t *testing.T) {
+// TestReplyRendersMarkdownToHTML: the agent answers in Markdown; replies go out
+// with ParseMode=HTML, markup rendered to allowed tags and stray specials (and
+// any literal HTML) escaped so Telegram can't reject the parse.
+func TestReplyRendersMarkdownToHTML(t *testing.T) {
 	f := newFakeAPI(t)
 	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "<b>итог</b>: 1 < 2 <script>x</script>", nil
+		return "**итог**: 1 < 2 <script>x</script>", nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
@@ -141,7 +142,7 @@ func TestReplySanitizesAndSendsHTML(t *testing.T) {
 	sent := f.sentMessages()
 	want := "<b>итог</b>: 1 &lt; 2 &lt;script&gt;x&lt;/script&gt;"
 	if len(sent) != 1 || sent[0].Text != want || sent[0].ParseMode != "HTML" {
-		t.Fatalf("want sanitized HTML reply %q, got %+v", want, sent)
+		t.Fatalf("want rendered HTML reply %q, got %+v", want, sent)
 	}
 }
 
@@ -151,7 +152,7 @@ func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
 	f := newFakeAPI(t)
 	f.rejectHTML = true
 	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "<b>жирный</b> текст", nil
+		return "**жирный** текст", nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
