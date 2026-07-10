@@ -65,13 +65,15 @@ var newSessionKeyboard = &models.InlineKeyboardMarkup{
 // rejected users with a fixed refusal so the bot doesn't look dead to a
 // stranger (there are only two allowed users).
 type Bot struct {
-	api          *bot.Bot
-	secret       string
-	allowed      map[int64]struct{}
-	handler      Handler
-	onNewSession func(ctx context.Context, userID int64) error
-	seen         *dedupe
-	logger       *slog.Logger
+	api            *bot.Bot
+	secret         string
+	allowed        map[int64]struct{}
+	handler        Handler
+	onNewSession   func(ctx context.Context, userID int64) error
+	onMemoryList   func(ctx context.Context, userID int64) ([]MemoryItem, error)
+	onMemoryForget func(ctx context.Context, userID int64, key string) error
+	seen           *dedupe
+	logger         *slog.Logger
 }
 
 // New builds the bot. It calls getMe under the hood, so a bad token fails
@@ -120,6 +122,18 @@ func (b *Bot) API() *bot.Bot { return b.api }
 // before StartWebhook.
 func (b *Bot) OnNewSession(f func(ctx context.Context, userID int64) error) { b.onNewSession = f }
 
+// OnMemory installs the read/delete hooks the /memory command uses: list a
+// user's durable preferences and forget one by key. Both must be set for the
+// command to work; without them /memory is silently inert. Must be called
+// before StartWebhook.
+func (b *Bot) OnMemory(
+	list func(ctx context.Context, userID int64) ([]MemoryItem, error),
+	forget func(ctx context.Context, userID int64, key string) error,
+) {
+	b.onMemoryList = list
+	b.onMemoryForget = forget
+}
+
 // Me returns the bot's own account (startup logging).
 func (b *Bot) Me(ctx context.Context) (*models.User, error) {
 	return b.api.GetMe(ctx)
@@ -146,6 +160,8 @@ func (b *Bot) RegisterWebhook(ctx context.Context, url string) error {
 	}
 	_, err := b.api.SetMyCommands(ctx, &bot.SetMyCommandsParams{
 		Commands: []models.BotCommand{
+			{Command: "menu", Description: "Готовые вопросы"},
+			{Command: "memory", Description: "Что бот о вас помнит"},
 			{Command: "new", Description: "Новый диалог — забыть контекст"},
 		},
 	})
@@ -178,6 +194,13 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 
+	// Bot-owned commands (menu, memory) are answered here with their own
+	// keyboards, before the message reaches the agent handler. Commands the bot
+	// doesn't own (like /new) fall through to the handler unchanged.
+	if cmd := parseCommand(msg.Text); cmd != "" && b.handleCommand(ctx, log, msg, cmd) {
+		return
+	}
+
 	// Agent answers take seconds to minutes; keep the "typing…" indicator
 	// alive (Telegram drops it after ~5s) until the handler returns.
 	stopTyping := b.startTyping(ctx, msg.Chat.ID)
@@ -194,16 +217,115 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	b.reply(ctx, log, msg.Chat.ID, text, true)
 }
 
-// onCallback handles an inline-button press. The only button today is
-// "new dialog", which resets the agent's memory for the chat.
+// parseCommand extracts a leading "/command" token from message text, stripping
+// any "@botname" suffix and arguments. Returns "" when the text isn't a command.
+func parseCommand(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "/") {
+		return ""
+	}
+	if i := strings.IndexAny(t, " \t\n"); i >= 0 {
+		t = t[:i]
+	}
+	if i := strings.IndexByte(t, '@'); i >= 0 {
+		t = t[:i]
+	}
+	return t
+}
+
+// handleCommand answers the bot-owned commands and reports whether it did. The
+// menu commands render an inline keyboard the plain message pipe can't attach,
+// so they are served here rather than through the agent handler. Anything the
+// bot doesn't own returns false to fall through to the handler.
+func (b *Bot) handleCommand(ctx context.Context, log *slog.Logger, msg *models.Message, cmd string) bool {
+	switch cmd {
+	case "/menu", "/start", "/help":
+		b.sendRaw(ctx, log, msg.Chat.ID, msgMenuPrompt, menuKeyboard())
+		return true
+	case "/memory":
+		b.showMemory(ctx, log, msg.From.ID, msg.Chat.ID)
+		return true
+	default:
+		return false
+	}
+}
+
+// showMemory answers /memory with the user's durable profile and its delete
+// buttons. With no memory hooks wired it does nothing (the command is inert).
+func (b *Bot) showMemory(ctx context.Context, log *slog.Logger, userID, chatID int64) {
+	if b.onMemoryList == nil {
+		return
+	}
+	items, err := b.onMemoryList(ctx, userID)
+	if err != nil {
+		log.Error("memory list failed", "err", err)
+		b.reply(ctx, log, chatID, "Не удалось прочитать память, попробуйте позже.", false)
+		return
+	}
+	text, markup := renderMemory(items)
+	b.sendRaw(ctx, log, chatID, text, asReplyMarkup(markup))
+}
+
+// editMemory re-renders the /memory message in place after a deletion.
+func (b *Bot) editMemory(ctx context.Context, log *slog.Logger, q *models.CallbackQuery, items []MemoryItem) {
+	text, markup := renderMemory(items)
+	_, err := b.api.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:      q.Message.Message.Chat.ID,
+		MessageID:   q.Message.Message.ID,
+		Text:        text,
+		ParseMode:   models.ParseModeHTML,
+		ReplyMarkup: asReplyMarkup(markup),
+	})
+	if err != nil {
+		log.Debug("edit memory message failed", "err", err)
+	}
+}
+
+// asReplyMarkup boxes a possibly-nil keyboard into the ReplyMarkup interface
+// while preserving nil-ness — a typed nil pointer in the interface would
+// serialize as an empty markup instead of being omitted.
+func asReplyMarkup(m *models.InlineKeyboardMarkup) models.ReplyMarkup {
+	if m == nil {
+		return nil
+	}
+	return m
+}
+
+// sendRaw sends already-rendered Telegram-HTML (menu prompt, memory list) with
+// an optional keyboard. Unlike reply, it does not run the text through the
+// Markdown renderer — the caller owns the markup and escaping. A 400 parse
+// error falls back to a tag-stripped plain-text send.
+func (b *Bot) sendRaw(ctx context.Context, log *slog.Logger, chatID int64, htmlText string, markup models.ReplyMarkup) {
+	_, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        htmlText,
+		ParseMode:   models.ParseModeHTML,
+		ReplyMarkup: markup,
+	})
+	if err != nil && errors.Is(err, bot.ErrorBadRequest) {
+		log.Warn("HTML message rejected, resending as plain text", "err", err)
+		_, err = b.api.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:      chatID,
+			Text:        stripTags(htmlText),
+			ReplyMarkup: markup,
+		})
+	}
+	if err != nil {
+		log.Error("sendMessage failed", "err", err)
+	}
+}
+
+// onCallback handles an inline-button press and routes it by callback data:
+// the "new dialog" reset, a quick-reply question, or a memory-delete button.
 func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	log := b.logger.With("callback_id", q.ID, "user_id", q.From.ID)
-	// Always ack, even on the ignore paths — otherwise the client spins.
-	defer func() {
-		if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
-			log.Debug("answerCallbackQuery failed", "err", err)
-		}
-	}()
+	// Ack up front, not on return: a quick-reply press runs the agent for
+	// seconds to minutes, and Telegram rejects an answerCallbackQuery that
+	// arrives after its ~15s window — leaving the button spinner stuck. Acking
+	// first clears the spinner immediately and covers every path below.
+	if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
+		log.Debug("answerCallbackQuery failed", "err", err)
+	}
 
 	if _, ok := b.allowed[q.From.ID]; !ok {
 		log.Warn("callback from user not in allowlist")
@@ -211,7 +333,23 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	}
 	// Message can be inaccessible when the button is older than 48h — then
 	// there is no chat to answer in, so drop the press.
-	if q.Data != callbackNewSession || q.Message.Message == nil || b.onNewSession == nil {
+	if q.Message.Message == nil {
+		return
+	}
+
+	switch {
+	case q.Data == callbackNewSession:
+		b.doNewSession(ctx, log, q)
+	case strings.HasPrefix(q.Data, quickReplyPrefix):
+		b.doQuickReply(ctx, log, q)
+	case strings.HasPrefix(q.Data, memForgetPrefix):
+		b.doMemoryForget(ctx, log, q)
+	}
+}
+
+// doNewSession resets the agent's dialog memory for the chat behind q.
+func (b *Bot) doNewSession(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
+	if b.onNewSession == nil {
 		return
 	}
 	chatID := q.Message.Message.Chat.ID
@@ -223,6 +361,65 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	}
 	log.Info("new session started", "user_id", userID)
 	b.reply(ctx, log, chatID, MsgSessionReset, false)
+}
+
+// doQuickReply runs the tapped template question through the agent exactly as
+// if the user had typed it: it echoes the question so the chat reads as a
+// dialog, then answers with the usual "new dialog" button attached.
+func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
+	question, ok := templateByCallback(q.Data)
+	if !ok || b.handler == nil {
+		return
+	}
+	chatID := q.Message.Message.Chat.ID
+	b.reply(ctx, log, chatID, "❓ "+question, false)
+
+	synthetic := &models.Message{From: &q.From, Chat: q.Message.Message.Chat, Text: question}
+	stopTyping := b.startTyping(ctx, chatID)
+	text, err := b.handler.Handle(ctx, synthetic)
+	stopTyping()
+	if err != nil {
+		log.Error("quick-reply handler failed", "err", err)
+		b.reply(ctx, log, chatID, "Что-то пошло не так, попробуйте ещё раз.", false)
+		return
+	}
+	if text == "" {
+		return
+	}
+	b.reply(ctx, log, chatID, text, true)
+}
+
+// doMemoryForget deletes the preference behind a delete button, then re-renders
+// the /memory message in place. The index is resolved against a fresh read: an
+// out-of-range stale index just re-renders instead of erroring. (In this private
+// 1-on-1 bot the profile only changes on the same user's actions, so an
+// in-range index racing a concurrent edit is not a practical concern.)
+func (b *Bot) doMemoryForget(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
+	if b.onMemoryList == nil || b.onMemoryForget == nil {
+		return
+	}
+	idx, ok := indexFromCallback(q.Data, memForgetPrefix)
+	if !ok {
+		return
+	}
+	userID := q.From.ID
+	items, err := b.onMemoryList(ctx, userID)
+	if err != nil {
+		log.Error("memory list failed", "err", err)
+		return
+	}
+	if idx < len(items) {
+		if err := b.onMemoryForget(ctx, userID, items[idx].Key); err != nil {
+			log.Error("memory forget failed", "err", err)
+			return
+		}
+		log.Info("preference deleted via /memory", "key", items[idx].Key)
+		if items, err = b.onMemoryList(ctx, userID); err != nil {
+			log.Error("memory re-list failed", "err", err)
+			return
+		}
+	}
+	b.editMemory(ctx, log, q, items)
 }
 
 // maxMessageLen is Telegram's hard cap on sendMessage text.
