@@ -226,14 +226,15 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 // maxMessageLen is Telegram's hard cap on sendMessage text.
 const maxMessageLen = 4096
 
-// reply delivers text as Telegram-HTML. The text is sanitized first (the
-// agent is prompted to emit HTML, but the sanitizer is what guarantees it
-// parses), split into limit-sized chunks with tags balanced per chunk, and if
-// Telegram still rejects a chunk with 400 it is resent as plain text — a
-// degraded answer beats a swallowed one. withKeyboard hangs the "new dialog"
-// button under the last chunk — answers get it, service notices don't.
+// reply delivers text as Telegram-HTML. The agent answers in Markdown, which
+// renderTelegramHTML turns into balanced, whitelisted Telegram-HTML (the
+// renderer is what guarantees it parses); the result is split into limit-sized
+// chunks with tags balanced per chunk, and if Telegram still rejects a chunk
+// with 400 it is resent as plain text — a degraded answer beats a swallowed
+// one. withKeyboard hangs the "new dialog" button under the last chunk —
+// answers get it, service notices don't.
 func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string, withKeyboard bool) {
-	chunks := splitHTML(sanitizeHTML(normalizeMarkdown(text)), maxMessageLen)
+	chunks := splitHTML(renderTelegramHTML(text), maxMessageLen)
 	for i, chunk := range chunks {
 		var markup models.ReplyMarkup
 		if withKeyboard && i == len(chunks)-1 {

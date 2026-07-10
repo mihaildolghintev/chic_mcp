@@ -1,9 +1,7 @@
-// Telegram-HTML sanitizing for outgoing messages. The LLM is asked to answer
-// in Telegram's HTML subset, but one stray "<" or an unclosed tag makes
-// sendMessage reject the whole message with 400 — so everything we send is
-// normalized here first: allowed tags pass through, everything else is
-// escaped, unclosed tags are closed. See
-// https://core.telegram.org/bots/api#html-style for the tag whitelist.
+// Telegram-HTML message plumbing: splitting a rendered message across the
+// 4096-char limit and the plain-text fallback. The HTML itself is produced by
+// renderTelegramHTML (render.go), which guarantees balanced, whitelisted tags —
+// this file only moves that output around.
 package telegram
 
 import (
@@ -14,110 +12,13 @@ import (
 	"unicode/utf8"
 )
 
-var (
-	// openTagRe matches an opening tag Telegram accepts, anchored at the
-	// start. Groups 1-5 capture the tag name for the five attribute shapes.
-	openTagRe  = regexp.MustCompile(`^<(?:(b|strong|i|em|u|ins|s|strike|del|pre|tg-spoiler)|(blockquote)(?: expandable)?|(code)(?: class="language-[^"<>]*")?|(span) class="tg-spoiler"|(a) href="[^"<>]*")>`)
-	closeTagRe = regexp.MustCompile(`^</(b|strong|i|em|u|ins|s|strike|del|pre|tg-spoiler|blockquote|code|span|a)>`)
-	// entityRe matches the entities Telegram understands — the four named
-	// ones plus numeric; any other "&" must become &amp;.
-	entityRe = regexp.MustCompile(`^&(?:lt|gt|amp|quot|#[0-9]{1,7}|#x[0-9a-fA-F]{1,6});`)
-	// anyTagRe rescans tags in already-sanitized text (splitting, stripping).
-	anyTagRe = regexp.MustCompile(`<(/?)([a-z-]+)(?: [^<>]*)?>`)
-)
-
-var (
-	// Markdown the LLM slips into despite the prompt (and keeps imitating
-	// from pre-HTML replies in the dialog history): **bold**, ### headings
-	// and | tables |. Telegram renders none of it, so normalizeMarkdown
-	// rewrites these into HTML/plain lines before sanitizing.
-	mdBoldRe     = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
-	mdHeadingRe  = regexp.MustCompile(`(?m)^#{1,6} +([^\n]+?)[ #]*$`)
-	mdTableSepRe = regexp.MustCompile(`(?m)^ *\|?[ \t:|-]*-[ \t:|-]*\|? *$\n?`)
-	mdTableRowRe = regexp.MustCompile(`(?m)^ *\|(.+)\| *$`)
-)
-
-// normalizeMarkdown converts the markdown constructs Telegram can't render
-// into their closest Telegram-HTML shape: bold and headings become <b>, a
-// table row becomes one plain line with " — " between cells, separator rows
-// disappear. Everything else passes through for sanitizeHTML to handle.
-func normalizeMarkdown(s string) string {
-	s = mdTableSepRe.ReplaceAllString(s, "")
-	s = mdTableRowRe.ReplaceAllStringFunc(s, func(row string) string {
-		cells := strings.Split(strings.Trim(strings.TrimSpace(row), "|"), "|")
-		kept := make([]string, 0, len(cells))
-		for _, c := range cells {
-			if c = strings.TrimSpace(c); c != "" {
-				kept = append(kept, c)
-			}
-		}
-		return strings.Join(kept, " — ")
-	})
-	s = mdHeadingRe.ReplaceAllString(s, "<b>$1</b>")
-	s = mdBoldRe.ReplaceAllString(s, "<b>$1</b>")
-	return s
-}
+// anyTagRe rescans tags in already-rendered text (splitting, stripping).
+var anyTagRe = regexp.MustCompile(`<(/?)([a-z-]+)(?: [^<>]*)?>`)
 
 // openTag remembers an open tag: the literal token (to reopen it in the next
 // message chunk) and the bare name (to synthesize its closing tag).
 type openTag struct {
 	token, name string
-}
-
-// sanitizeHTML makes arbitrary text safe for sendMessage with ParseMode=HTML:
-// whitelisted tags pass through, any other <, > or & is escaped, orphan
-// closing tags are escaped, tags left open are closed at the end (a closing
-// tag also closes anything opened inside it, so overlap can't happen).
-func sanitizeHTML(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	var stack []openTag
-	for i := 0; i < len(s); {
-		switch s[i] {
-		case '<':
-			if m := openTagRe.FindStringSubmatch(s[i:]); m != nil {
-				name := m[1] + m[2] + m[3] + m[4] + m[5] // exactly one group is non-empty
-				stack = append(stack, openTag{token: m[0], name: name})
-				b.WriteString(m[0])
-				i += len(m[0])
-				continue
-			}
-			if m := closeTagRe.FindStringSubmatch(s[i:]); m != nil {
-				if idx := lastOpen(stack, m[1]); idx >= 0 {
-					for j := len(stack) - 1; j >= idx; j-- {
-						b.WriteString("</")
-						b.WriteString(stack[j].name)
-						b.WriteString(">")
-					}
-					stack = stack[:idx]
-					i += len(m[0])
-					continue
-				}
-			}
-			b.WriteString("&lt;")
-			i++
-		case '>':
-			b.WriteString("&gt;")
-			i++
-		case '&':
-			if m := entityRe.FindString(s[i:]); m != "" {
-				b.WriteString(m)
-				i += len(m)
-				continue
-			}
-			b.WriteString("&amp;")
-			i++
-		default:
-			b.WriteByte(s[i])
-			i++
-		}
-	}
-	for j := len(stack) - 1; j >= 0; j-- {
-		b.WriteString("</")
-		b.WriteString(stack[j].name)
-		b.WriteString(">")
-	}
-	return b.String()
 }
 
 func lastOpen(stack []openTag, name string) int {
@@ -129,8 +30,8 @@ func lastOpen(stack []openTag, name string) int {
 	return -1
 }
 
-// stripTags is the plain-text fallback: it removes the tags sanitizeHTML let
-// through and unescapes entities, for a resend without ParseMode.
+// stripTags is the plain-text fallback: it removes the whitelisted tags and
+// unescapes entities, for a resend without ParseMode.
 func stripTags(s string) string {
 	return html.UnescapeString(anyTagRe.ReplaceAllString(s, ""))
 }
@@ -139,11 +40,11 @@ func stripTags(s string) string {
 // closing/reopening tags it adds around a chunk boundary.
 const tagReserve = 128
 
-// splitHTML splits sanitized HTML into chunks that each parse on their own:
+// splitHTML splits rendered HTML into chunks that each parse on their own:
 // tags open at a cut are closed at the chunk's end and reopened at the start
-// of the next one. Input must come from sanitizeHTML (balanced, whitelisted
-// tags), which also makes a cut inside a tag token practically impossible —
-// it would take thousands of runes without a newline.
+// of the next one. Input must come from renderTelegramHTML (balanced,
+// whitelisted tags), which also makes a cut inside a tag token practically
+// impossible — it would take thousands of runes without a newline.
 func splitHTML(text string, limit int) []string {
 	if utf8.RuneCountInString(text) <= limit {
 		return []string{text}
@@ -167,7 +68,7 @@ func splitHTML(text string, limit int) []string {
 	return chunks
 }
 
-// scanTags advances the open-tag stack over one chunk of sanitized HTML.
+// scanTags advances the open-tag stack over one chunk of rendered HTML.
 func scanTags(stack []openTag, chunk string) []openTag {
 	for _, m := range anyTagRe.FindAllStringSubmatch(chunk, -1) {
 		if m[1] == "/" {

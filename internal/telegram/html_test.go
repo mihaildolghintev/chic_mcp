@@ -6,52 +6,48 @@ import (
 	"unicode/utf8"
 )
 
-func TestSanitizeHTML(t *testing.T) {
+func TestRenderTelegramHTML(t *testing.T) {
 	cases := []struct {
 		name, in, want string
 	}{
 		{"plain text untouched", "Привет, как дела?", "Привет, как дела?"},
-		{"allowed tags pass", "<b>итог</b> и <i>деталь</i>", "<b>итог</b> и <i>деталь</i>"},
-		{"code and pre pass", "<code>АРТ-1</code> <pre>x = 1</pre>", `<code>АРТ-1</code> <pre>x = 1</pre>`},
-		{"expandable blockquote passes", "<blockquote expandable>ещё 20 позиций</blockquote>", "<blockquote expandable>ещё 20 позиций</blockquote>"},
-		{"link passes", `<a href="https://chic.md">сайт</a>`, `<a href="https://chic.md">сайт</a>`},
-		{"language code passes", `<pre><code class="language-go">x</code></pre>`, `<pre><code class="language-go">x</code></pre>`},
-		{"unknown tag escaped", "<script>alert(1)</script>", "&lt;script&gt;alert(1)&lt;/script&gt;"},
-		{"table escaped", "<table><tr><td>x</td></tr></table>", "&lt;table&gt;&lt;tr&gt;&lt;td&gt;x&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;"},
+		{"bold", "скидка **50%** срочно", "скидка <b>50%</b> срочно"},
+		{"italic", "это *важно* сейчас", "это <i>важно</i> сейчас"},
+		{"inline code", "код `АРТ-1` тут", "код <code>АРТ-1</code> тут"},
+		{"heading to bold", "# 🔴 Категория 1", "<b>🔴 Категория 1</b>"},
+		{"link", "смотри [сайт](https://chic.md)", `смотри <a href="https://chic.md">сайт</a>`},
+		{"unsafe link becomes text", "[клик](javascript:alert(1))", "клик"},
 		{"stray specials escaped", "1 < 2 & 3 > 2", "1 &lt; 2 &amp; 3 &gt; 2"},
-		{"known entities kept", "&lt;b&gt; &amp; &#128512;", "&lt;b&gt; &amp; &#128512;"},
-		{"unknown entity escaped", "фирма&nbsp;X", "фирма&amp;nbsp;X"},
-		{"unclosed tag closed", "<b>жирный до конца", "<b>жирный до конца</b>"},
-		{"orphan close escaped", "просто</b> текст", "просто&lt;/b&gt; текст"},
-		{"overlap resolved by nesting", "<b>раз <i>два</b> три", "<b>раз <i>два</i></b> три"},
-		{"bare a without href escaped", "<a>ссылка</a>", "&lt;a&gt;ссылка&lt;/a&gt;"},
+		{"raw html shown as text", "<script>alert(1)</script>", "&lt;script&gt;alert(1)&lt;/script&gt;"},
+		{"soft break kept as newline", "остаток: 12\nцена: 500", "остаток: 12\nцена: 500"},
+		{"paragraphs separated", "итог\n\nдетали", "итог\n\nдетали"},
+		{"card layout", "📦 **Rimel 9ml**\nостаток: 12", "📦 <b>Rimel 9ml</b>\nостаток: 12"},
+		{"bullet list", "- раз\n- два", "• раз\n• два"},
+		{"ordered list", "1. раз\n2. два", "1. раз\n2. два"},
+		{"hr dropped", "итог\n\n---\n\nдетали", "итог\n\nдетали"},
+		{"table to lines", "| Товар | Остаток |\n|---|---|\n| Rimel | 12 |", "Товар — Остаток\nRimel — 12"},
+		{"short blockquote plain", "> заметка", "<blockquote>заметка</blockquote>"},
+		{"code fence with language", "```go\nx := 1\n```", `<pre><code class="language-go">x := 1</code></pre>`},
+		{"code fence escapes body", "```\na < b & c\n```", "<pre>a &lt; b &amp; c</pre>"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sanitizeHTML(tc.in); got != tc.want {
-				t.Errorf("sanitizeHTML(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			if got := renderTelegramHTML(tc.in); got != tc.want {
+				t.Errorf("renderTelegramHTML(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestNormalizeMarkdown(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{"bold", "скидка **50%** срочно", "скидка <b>50%</b> срочно"},
-		{"heading", "### 🔴 КАТЕГОРИЯ 1 — Аварийная", "<b>🔴 КАТЕГОРИЯ 1 — Аварийная</b>"},
-		{"table to lines", "| Товар | Остаток |\n|-------:|:-----|\n| **Rimel 9ml** | 12 шт |", "Товар — Остаток\n<b>Rimel 9ml</b> — 12 шт"},
-		{"hr dropped", "итог\n---\nдетали", "итог\nдетали"},
-		{"list dash kept", "- пункт раз\n- пункт два", "- пункт раз\n- пункт два"},
-		{"plain text untouched", "обычный ответ: 12 345 ₽", "обычный ответ: 12 345 ₽"},
+// TestRenderExpandableBlockquote checks a long quote collapses.
+func TestRenderExpandableBlockquote(t *testing.T) {
+	var lines []string
+	for i := 0; i < expandableLines+1; i++ {
+		lines = append(lines, "> строка")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := normalizeMarkdown(tc.in); got != tc.want {
-				t.Errorf("normalizeMarkdown(%q)\n got %q\nwant %q", tc.in, got, tc.want)
-			}
-		})
+	got := renderTelegramHTML(strings.Join(lines, "\n"))
+	if !strings.HasPrefix(got, "<blockquote expandable>") {
+		t.Errorf("long quote must be expandable, got %q", got)
 	}
 }
 
