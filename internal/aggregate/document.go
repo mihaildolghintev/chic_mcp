@@ -48,6 +48,28 @@ func DocumentSummaries(docs []moysklad.Document) []DocumentSummary {
 	return out
 }
 
+// DocumentTotals are the grand totals across every matching document — so the
+// model can answer "total sales for the period" without summing rows itself.
+type DocumentTotals struct {
+	Sum  float64 `json:"sum"`
+	Paid float64 `json:"paid"`
+}
+
+// DocumentReport summarizes documents, totals over all of them, and truncates
+// the detail list to limit. Order is preserved (the API sorts by moment desc),
+// so Rows is the most recent documents while Totals covers the whole period.
+func DocumentReport(docs []moysklad.Document, limit int) Report[DocumentSummary, DocumentTotals] {
+	rows := DocumentSummaries(docs)
+	var t DocumentTotals
+	for _, r := range rows {
+		t.Sum += r.Sum
+		t.Paid += r.Paid
+	}
+	t.Sum = round2(t.Sum)
+	t.Paid = round2(t.Paid)
+	return newReport(rows, t, limit)
+}
+
 // DocumentDetail is a document with its expanded positions.
 type DocumentDetail struct {
 	DocumentSummary

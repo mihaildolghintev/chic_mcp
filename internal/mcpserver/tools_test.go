@@ -62,20 +62,25 @@ func TestGetProfit_RoutesByGroupBy(t *testing.T) {
 	api := &fakeAPI{profitEntity: []moysklad.ProfitByEntityRow{
 		{Counterparty: &moysklad.NamedRef{Name: "ACME"}, SellSum: 500_00, Profit: 100_00, SalesCount: 3},
 	}}
-	var got struct {
-		Items []aggregate.ProfitEntityLine `json:"items"`
-	}
+	var got aggregate.Report[aggregate.ProfitEntityLine, aggregate.ProfitTotals]
 	callJSON(t, api, "get_profit", map[string]any{"group_by": "counterparty"}, &got)
 
 	if api.gotProfitDimension != "counterparty" {
 		t.Errorf("dimension passed to client = %q, want counterparty", api.gotProfitDimension)
 	}
-	if len(got.Items) != 1 || got.Items[0].Name != "ACME" || got.Items[0].Revenue != 500 {
-		t.Fatalf("entity line wrong: %+v", got.Items)
+	if len(got.Rows) != 1 || got.Rows[0].Name != "ACME" || got.Rows[0].Revenue != 500 {
+		t.Fatalf("entity line wrong: %+v", got.Rows)
 	}
 	// margin = profit/revenue*100 = 100/500 = 20%.
-	if got.Items[0].MarginPct != 20 {
-		t.Errorf("marginPct = %v, want 20", got.Items[0].MarginPct)
+	if got.Rows[0].MarginPct != 20 {
+		t.Errorf("marginPct = %v, want 20", got.Rows[0].MarginPct)
+	}
+	// Totals must be present and match the single row.
+	if got.Totals.Revenue != 500 || got.Totals.Profit != 100 || got.Totals.MarginPct != 20 {
+		t.Errorf("totals wrong: %+v", got.Totals)
+	}
+	if got.RowCount != 1 || got.Truncated {
+		t.Errorf("rowCount=%d truncated=%v, want 1/false", got.RowCount, got.Truncated)
 	}
 }
 
