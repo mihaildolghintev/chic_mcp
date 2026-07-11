@@ -40,12 +40,12 @@ func TestHandle_SummarizesOverflowingHistory(t *testing.T) {
 	a, st := newTestAgent(t, script, &fakeAPI{}, Options{})
 	seedHistory(t, st, 7, 10) // 10 turns × ~1KB ≫ 8000-char budget
 
-	answer, err := a.Handle(context.Background(), 7, "новый вопрос", "")
+	res, err := a.Handle(context.Background(), 7, "новый вопрос", "")
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if answer != "Итоговый ответ." {
-		t.Errorf("answer = %q", answer)
+	if res.Text != "Итоговый ответ." {
+		t.Errorf("answer = %q", res.Text)
 	}
 	if len(script.requests) != 2 {
 		t.Fatalf("want a summarize call then an answer call, got %d requests", len(script.requests))

@@ -37,6 +37,22 @@ const (
 	msgNoVision    = "Обработка фото не настроена (нет vision-провайдера). Пришлите вопрос текстом."
 )
 
+// askUserTool is the one tool the agent injects on top of the MCP and memory
+// surfaces: the model calls it to bounce an ambiguous request back to the human
+// as a multiple-choice question. The loop intercepts it — it never reaches the
+// MCP server, and the user's choice returns as the next message.
+const askUserTool = "ask_user"
+
+// Result is one agent turn. A plain answer has Options == nil and Text is the
+// reply. A clarifying question has non-empty Options: Text is the question and
+// Options are the offered choices the bot renders as an inline keyboard;
+// AllowCustom adds a free-text "свой вариант" affordance.
+type Result struct {
+	Text        string
+	Options     []string
+	AllowCustom bool
+}
+
 // Options tune the agent; zero values take the defaults below.
 type Options struct {
 	MaxRounds    int           // LLM⇄tools round trips per request (default 50)
@@ -128,6 +144,9 @@ func New(ctx context.Context, llmClient *llm.Client, srv *server.MCPServer, st s
 	// surface: they mutate per-user state the MCP server has no notion of, so
 	// the dispatch loop handles them against the store with the live user id.
 	tools = append(tools, memoryTools...)
+	// ask_user is intercepted by the dispatch loop (it needs the human, out of
+	// process), so it is advertised here but never routed to MCP or the store.
+	tools = append(tools, askUserToolDef())
 	slog.Info("agent ready", "tools", len(tools))
 
 	return &Agent{
@@ -175,8 +194,9 @@ func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
 // Handle answers one user message. userID identifies the Telegram user (the
 // key for both dialog history and durable memory); text is the message text
 // (or the photo caption), imageDataURI is a base64 data URI when the message
-// carries a photo. The returned string is always safe to send to the user.
-func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI string) (string, error) {
+// carries a photo. The returned Result is always safe to send to the user —
+// either a final answer or a clarifying question with options.
+func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI string) (Result, error) {
 	ctx, span := tracing.Tracer().Start(ctx, "agent.handle")
 	defer span.End()
 	span.SetAttributes(
@@ -188,25 +208,25 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 		tracing.Input(text),
 	)
 
-	answer, err := a.handle(ctx, span, userID, text, imageDataURI)
+	res, err := a.handle(ctx, span, userID, text, imageDataURI)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		return answer, err
+		return res, err
 	}
-	span.SetAttributes(tracing.Output(answer))
-	return answer, nil
+	span.SetAttributes(tracing.Output(res.Text))
+	return res, nil
 }
 
 // handle runs the agentic loop for one message; Handle wraps it in the AGENT
 // span. The span is threaded in so the loop can annotate it with the round and
 // token totals once the answer is known.
-func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text, imageDataURI string) (string, error) {
+func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text, imageDataURI string) (Result, error) {
 	if !a.allow(userID) {
-		return msgRateLimited, nil
+		return Result{Text: msgRateLimited}, nil
 	}
 	if imageDataURI != "" && !a.llm.HasVision() {
-		return msgNoVision, nil
+		return Result{Text: msgNoVision}, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, a.opts.Timeout)
 	defer cancel()
@@ -250,9 +270,9 @@ func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text,
 		resp, err := a.llm.Chat(ctx, llm.Request{Messages: msgs, Tools: a.tools})
 		if err != nil {
 			if errors.Is(err, llm.ErrNoVisionProvider) {
-				return msgNoVision, nil
+				return Result{Text: msgNoVision}, nil
 			}
-			return "", fmt.Errorf("agent: llm round %d: %w", round+1, err)
+			return Result{}, fmt.Errorf("agent: llm round %d: %w", round+1, err)
 		}
 		spent += resp.Usage.TotalTokens
 		msgs = append(msgs, resp.Message)
@@ -265,17 +285,45 @@ func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text,
 				attribute.Int("llm.token_count.total", spent),
 			)
 			log.Info("agent answered", "rounds", round+1, "tokens", spent, "provider", resp.Provider)
-			return answer, nil
+			return Result{Text: answer}, nil
+		}
+
+		// ask_user is the model's "I need a human decision" signal. It has no
+		// server side: intercept it as a terminal step, persist the question as
+		// this turn's assistant reply, and hand the options to the bot. The
+		// user's choice returns as the next message and the loop resumes from
+		// history — no mid-loop state to serialize.
+		for _, tc := range resp.Message.ToolCalls {
+			if tc.Function.Name != askUserTool {
+				continue
+			}
+			if q, ok := parseAskUser(tc.Function.Arguments); ok {
+				a.remember(ctx, log, userID, stored, q.Text)
+				span.SetAttributes(
+					attribute.Int("agent.rounds", round+1),
+					attribute.Int("llm.token_count.total", spent),
+					attribute.Int("agent.ask_options", len(q.Options)),
+				)
+				log.Info("agent asked user", "rounds", round+1, "options", len(q.Options))
+				return q, nil
+			}
 		}
 
 		// The stop-loss sits between rounds: one completion can't be undone,
 		// but we can refuse to fund the next batch of tool calls.
 		if spent > a.opts.MaxTokens {
 			log.Warn("token stop-loss tripped", "tokens", spent, "budget", a.opts.MaxTokens)
-			return msgBudgetSpent, nil
+			return Result{Text: msgBudgetSpent}, nil
 		}
 
 		for _, tc := range resp.Message.ToolCalls {
+			// A malformed ask_user falls through here: steer the model instead
+			// of routing a human-only tool to MCP and confusing it.
+			if tc.Function.Name == askUserTool {
+				msgs = append(msgs, llm.ToolResult(tc.ID,
+					"ERROR: ask_user требует непустой question и минимум 2 варианта в options"))
+				continue
+			}
 			started := time.Now()
 			result := a.dispatchTool(ctx, userID, tc)
 			log.Info("tool called", "tool", tc.Function.Name, "took", time.Since(started).Round(time.Millisecond))
@@ -294,15 +342,78 @@ func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text,
 // reply with text. It is the round-limit fallback: a synthesized answer from the
 // context gathered so far beats telling the user to rephrase. Errors propagate
 // (the bot renders its own generic apology); an empty reply is returned as-is.
-func (a *Agent) forceFinalAnswer(ctx context.Context, log *slog.Logger, userID int64, stored string, msgs []llm.Message) (string, error) {
+func (a *Agent) forceFinalAnswer(ctx context.Context, log *slog.Logger, userID int64, stored string, msgs []llm.Message) (Result, error) {
 	resp, err := a.llm.Chat(ctx, llm.Request{Messages: msgs}) // no Tools: text only
 	if err != nil {
-		return "", fmt.Errorf("agent: forced final answer: %w", err)
+		return Result{}, fmt.Errorf("agent: forced final answer: %w", err)
 	}
 	answer := strings.TrimSpace(resp.Message.Text)
 	a.remember(ctx, log, userID, stored, answer)
 	log.Info("agent answered (forced)", "tokens", resp.Usage.TotalTokens, "provider", resp.Provider)
-	return answer, nil
+	return Result{Text: answer}, nil
+}
+
+// askUserToolDef is the virtual tool advertised to the model alongside the MCP
+// and memory tools. It never executes: the handle loop intercepts a call to it,
+// so this only teaches the model when and how to ask a clarifying question.
+func askUserToolDef() llm.Tool {
+	return llm.Tool{
+		Type: "function",
+		Function: llm.Function{
+			Name: askUserTool,
+			Description: "Задать пользователю уточняющий вопрос с вариантами ответа, когда запрос неоднозначный " +
+				"(неясен период, склад, единица измерения и т.п.). Обработка останавливается до ответа пользователя.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"question": {
+						"type": "string",
+						"description": "Короткий вопрос пользователю."
+					},
+					"options": {
+						"type": "array",
+						"items": {"type": "string"},
+						"description": "2–4 коротких взаимоисключающих варианта ответа."
+					},
+					"allow_custom": {
+						"type": "boolean",
+						"description": "Разрешить пользователю написать свой вариант ответом."
+					}
+				},
+				"required": ["question", "options"],
+				"additionalProperties": false
+			}`),
+		},
+	}
+}
+
+// parseAskUser reads an ask_user tool call. ok is false when the arguments are
+// malformed or the question is empty (the caller then steers the model). Fewer
+// than two real options isn't a choice, so it degrades to a plain-text question
+// (Options == nil).
+func parseAskUser(arguments string) (Result, bool) {
+	var a struct {
+		Question    string   `json:"question"`
+		Options     []string `json:"options"`
+		AllowCustom bool     `json:"allow_custom"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(arguments)), &a); err != nil {
+		return Result{}, false
+	}
+	q := strings.TrimSpace(a.Question)
+	if q == "" {
+		return Result{}, false
+	}
+	var opts []string
+	for _, o := range a.Options {
+		if o = strings.TrimSpace(o); o != "" {
+			opts = append(opts, o)
+		}
+	}
+	if len(opts) < 2 {
+		return Result{Text: q}, true
+	}
+	return Result{Text: q, Options: opts, AllowCustom: a.AllowCustom}, true
 }
 
 // dispatchTool routes one tool call. Memory tools are handled locally against
@@ -444,7 +555,10 @@ func systemPrompt(now time.Time, currencyCode, currencyName string, prefs []stor
 - %s
 - Данные бери только из инструментов, ничего не выдумывай.
 - Если вопрос про период ("за неделю", "в марте") — вычисли даты от сегодняшней.
-- Если вопрос неоднозначный, задай короткий уточняющий вопрос вместо догадок.
+- Если запрос неоднозначный (неясен период, склад, единица и т.п.), не гадай:
+  вызови инструмент ask_user с коротким вопросом и 2–4 взаимоисключающими
+  вариантами. Ставь allow_custom=true, когда уместен свой ответ текстом.
+  Не задавай уточнение обычным текстом — только через ask_user.
 - Для итогов за период бери поле "totals" из ответа инструмента — оно посчитано
   по ВСЕМ строкам. Никогда не суммируй "rows" вручную: это лишь верхушка списка,
   а "truncated"/"rowCount" показывают, что строк больше, чем показано.

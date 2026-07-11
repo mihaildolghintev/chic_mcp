@@ -182,8 +182,8 @@ func TestAllowedUserGetsEcho(t *testing.T) {
 // any literal HTML) escaped so Telegram can't reject the parse.
 func TestReplyRendersMarkdownToHTML(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "**итог**: 1 < 2 <script>x</script>", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "**итог**: 1 < 2 <script>x</script>"}, nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
@@ -200,8 +200,8 @@ func TestReplyRendersMarkdownToHTML(t *testing.T) {
 func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
 	f := newFakeAPI(t)
 	f.rejectHTML = true
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "**жирный** текст", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "**жирный** текст"}, nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
@@ -343,8 +343,8 @@ func TestDuplicateUpdateProcessedOnce(t *testing.T) {
 
 func TestHandlerErrorRepliesApology(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "", errors.New("boom")
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{}, errors.New("boom")
 	}))
 
 	process(b, update(1, 100, "сломайся"))
@@ -357,14 +357,106 @@ func TestHandlerErrorRepliesApology(t *testing.T) {
 
 func TestEmptyReplySendsNothing(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{}, nil
 	}))
 
 	process(b, update(1, 100, "молчи"))
 
 	if sent := f.sentMessages(); len(sent) != 0 {
 		t.Fatalf("want no replies, got %+v", sent)
+	}
+}
+
+// clarifyCallbackUpdate is a button press under a clarifying question: the
+// pressed message carries the option keyboard so buttonLabel can recover the
+// chosen label from callback data.
+func clarifyCallbackUpdate(id, userID, chatID int64, data string, options []string) *models.Update {
+	rows := make([][]models.InlineKeyboardButton, 0, len(options)+1)
+	for i, opt := range options {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: opt, CallbackData: clarifyPrefix + strconv.Itoa(i)},
+		})
+	}
+	rows = append(rows, []models.InlineKeyboardButton{
+		{Text: "✏️ Свой вариант", CallbackData: clarifyCustom},
+	})
+	u := callbackUpdate(id, userID, chatID, data)
+	u.CallbackQuery.Message.Message.Text = "За какой период?"
+	u.CallbackQuery.Message.Message.ReplyMarkup = &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+	return u
+}
+
+// TestClarifyingQuestionRendersKeyboard: a Reply with options goes out as one
+// message whose inline keyboard has an indexed button per option plus the
+// "свой вариант" button — and no feedback buttons (it's a question, not an
+// answer).
+func TestClarifyingQuestionRendersKeyboard(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "За какой период?", Options: []string{"За неделю", "За месяц"}, AllowCustom: true}, nil
+	}))
+
+	process(b, update(1, 100, "покажи продажи"))
+
+	sent := f.sentMessages()
+	if len(sent) != 1 {
+		t.Fatalf("want 1 question message, got %+v", sent)
+	}
+	mk := sent[0].ReplyMarkup
+	for _, want := range []string{`"cq:0"`, `"cq:1"`, `"cq:custom"`, "За неделю", "За месяц", "Свой вариант"} {
+		if !strings.Contains(mk, want) {
+			t.Errorf("keyboard missing %q, got %s", want, mk)
+		}
+	}
+	if strings.Contains(mk, feedbackLike) {
+		t.Errorf("question must not carry feedback buttons, got %s", mk)
+	}
+}
+
+// TestClarifyOptionCallbackResumes: tapping an option rewrites the question with
+// the choice (dropping the keyboard) and feeds the label back through the agent
+// as the next user turn.
+func TestClarifyOptionCallbackResumes(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, HandlerFunc(func(_ context.Context, msg *models.Message) (Reply, error) {
+		return Reply{Text: "выбрано: " + msg.Text}, nil
+	}))
+
+	process(b, clarifyCallbackUpdate(1, 100, 100, "cq:1", []string{"За неделю", "За месяц"}))
+
+	edited := f.editedMessages()
+	if len(edited) != 1 || !strings.Contains(edited[0].Text, "За какой период?") || !strings.Contains(edited[0].Text, "✅ За месяц") {
+		t.Fatalf("want question rewritten with choice, got %+v", edited)
+	}
+	sent := f.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "выбрано: За месяц") {
+		t.Fatalf("want resume with chosen label, got %+v", sent)
+	}
+}
+
+// TestClarifyCustomCallbackNudges: the "свой вариант" button clears the keyboard
+// and asks for a written answer without invoking the agent.
+func TestClarifyCustomCallbackNudges(t *testing.T) {
+	f := newFakeAPI(t)
+	called := false
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		called = true
+		return Reply{Text: "не должно вызваться"}, nil
+	}))
+
+	process(b, clarifyCallbackUpdate(1, 100, 100, clarifyCustom, []string{"За неделю", "За месяц"}))
+
+	if called {
+		t.Error("custom-variant press must not invoke the handler")
+	}
+	edited := f.editedMessages()
+	if len(edited) != 1 || edited[0].ReplyMarkup != "" {
+		t.Fatalf("want keyboard cleared, got %+v", edited)
+	}
+	sent := f.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "Напишите свой вариант") {
+		t.Fatalf("want free-text nudge, got %+v", sent)
 	}
 }
 
@@ -473,11 +565,11 @@ func TestParseAllowedIDs(t *testing.T) {
 
 func TestEchoPhotoStub(t *testing.T) {
 	msg := &models.Message{Photo: []models.PhotoSize{{FileID: "x"}}}
-	text, err := Echo().Handle(context.Background(), msg)
+	rep, err := Echo().Handle(context.Background(), msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text == "" || text == msg.Text {
-		t.Fatalf("want photo stub reply, got %q", text)
+	if rep.Text == "" || rep.Text == msg.Text {
+		t.Fatalf("want photo stub reply, got %q", rep.Text)
 	}
 }
