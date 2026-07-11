@@ -14,6 +14,10 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"go.opentelemetry.io/otel/codes"
+
+	"mcp.chic.md/internal/tracing"
 )
 
 // ErrNoVisionProvider is returned when a request carries an image but no
@@ -121,13 +125,41 @@ type wireResponse struct {
 	} `json:"error"`
 }
 
-// Chat picks a provider for the request content and runs one completion.
+// Chat picks a provider for the request content and runs one completion. It
+// opens an OpenInference LLM span so Phoenix shows the model, provider, token
+// counts and the messages in/out; the actual HTTP round trip lives in chat.
 func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 	p, err := c.pick(req.Messages)
 	if err != nil {
 		return nil, err
 	}
 
+	ctx, span := tracing.Tracer().Start(ctx, "llm."+p.Name)
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindLLM),
+		tracing.ModelName(p.Model),
+		tracing.Provider(p.Name),
+	)
+	if in, err := json.Marshal(req.Messages); err == nil {
+		span.SetAttributes(tracing.InputJSON(string(in))...)
+	}
+
+	resp, err := c.chat(ctx, p, req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+	span.SetAttributes(tracing.Tokens(resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)...)
+	if out, err := json.Marshal(resp.Message); err == nil {
+		span.SetAttributes(tracing.OutputJSON(string(out))...)
+	}
+	return resp, nil
+}
+
+// chat runs one completion against an already-picked provider.
+func (c *Client) chat(ctx context.Context, p *Provider, req Request) (*Response, error) {
 	body, err := json.Marshal(wireRequest{
 		Model:     p.Model,
 		Messages:  req.Messages,

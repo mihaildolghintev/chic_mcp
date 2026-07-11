@@ -89,6 +89,16 @@ The binary picks a mode via `-transport` (or `MCP_TRANSPORT`), default `bot`:
 
 All knobs are documented in [.env.example](.env.example).
 
+## Observability (optional)
+
+Off by default — the project runs fully without it. Set
+`PHOENIX_COLLECTOR_ENDPOINT` to an [Arize Phoenix](https://arize.com/phoenix/)
+collector (OTLP/HTTP) and the bot emits OpenTelemetry traces with OpenInference
+semantics: an `AGENT` span per message, nested `LLM` spans (model, provider,
+token counts) and `TOOL` spans (arguments, result). Leave the variable unset and
+no tracer is installed — spans become no-ops, nothing is exported, and there is
+no runtime cost. See the tracing block in [.env.example](.env.example).
+
 ## Run locally (macOS, Apple Silicon)
 
 Pure Go, no CGO — `make build` produces a native `arm64` binary with no runtime

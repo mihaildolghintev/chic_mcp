@@ -34,6 +34,7 @@ import (
 	"mcp.chic.md/internal/moysklad"
 	"mcp.chic.md/internal/store"
 	"mcp.chic.md/internal/telegram"
+	"mcp.chic.md/internal/tracing"
 )
 
 func main() {
@@ -179,6 +180,22 @@ func runBot() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Tracing is opt-in (PHOENIX_COLLECTOR_ENDPOINT); disabled it's a no-op. The
+	// shutdown flushes the batch processor, so it must run on exit or the last
+	// spans of the final request are dropped.
+	shutdownTracing, err := tracing.Init(ctx)
+	if err != nil {
+		slog.Error("tracing init", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelFlush()
+		if err := shutdownTracing(flushCtx); err != nil {
+			slog.Warn("tracing shutdown", "err", err)
+		}
+	}()
 
 	api, closeCache := buildAPI(requireEnv("MOYSKLAD_TOKEN"))
 	defer closeCache()
