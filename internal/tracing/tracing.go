@@ -89,6 +89,18 @@ func Tracer() trace.Tracer { return otel.Tracer(tracerName) }
 // SpanKind tags a span with its OpenInference kind (SpanKind* constant).
 func SpanKind(kind string) attribute.KeyValue { return attribute.String(keySpanKind, kind) }
 
+// SpanID returns the span's 16-hex id when the span is recording, or "" when
+// tracing is disabled (the no-op tracer yields an invalid span context). It is
+// what anchors a Phoenix feedback annotation to this span — and doubles as the
+// signal for "is there anything to annotate", so a disabled tracer means no
+// 👍/👎 affordance is shown at all.
+func SpanID(span trace.Span) string {
+	if sc := span.SpanContext(); sc.IsValid() {
+		return sc.SpanID().String()
+	}
+	return ""
+}
+
 // Input/Output record the span's payload. The JSON variants tell Phoenix to
 // pretty-print the value; use them for messages and tool arguments, the plain
 // variants for a user question or a final answer.

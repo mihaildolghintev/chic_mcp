@@ -16,7 +16,23 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
+
+// enableTestTracer installs a real (recording) TracerProvider for the duration
+// of a test, so spans carry a valid id — the signal reply() uses to decide the
+// 👍/👎 buttons are worth showing. Restored to the no-op provider on cleanup.
+func enableTestTracer(t *testing.T) {
+	t.Helper()
+	tp := sdktrace.NewTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(noop.NewTracerProvider())
+	})
+}
 
 // fakeAPI is a stub Telegram Bot API server recording sendMessage calls.
 // With rejectHTML set it answers any HTML-mode sendMessage with the 400 a
@@ -53,6 +69,18 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 				ChatID:      chatID,
 				Text:        r.FormValue("text"),
 				ParseMode:   r.FormValue("parse_mode"),
+				ReplyMarkup: r.FormValue("reply_markup"),
+			})
+			f.mu.Unlock()
+			result = map[string]any{"message_id": 1, "date": 0, "chat": map[string]any{"id": chatID}}
+		case strings.HasSuffix(r.URL.Path, "/editMessageReplyMarkup"):
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("editMessageReplyMarkup form: %v", err)
+			}
+			chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
+			f.mu.Lock()
+			f.edited = append(f.edited, sentMessage{
+				ChatID:      chatID,
 				ReplyMarkup: r.FormValue("reply_markup"),
 			})
 			f.mu.Unlock()
@@ -190,9 +218,11 @@ func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
 	}
 }
 
-// TestReplyCarriesNewSessionButton: handler answers get the inline "new
-// dialog" button; service notices (like the refusal) don't.
-func TestReplyCarriesNewSessionButton(t *testing.T) {
+// TestReplyCarriesFeedbackButtons: with tracing on, handler answers get the
+// 👍/👎 buttons (each encoding the trace's span id); service notices (like the
+// refusal) don't.
+func TestReplyCarriesFeedbackButtons(t *testing.T) {
+	enableTestTracer(t)
 	f := newFakeAPI(t)
 	b := newTestBot(t, f, Echo())
 
@@ -203,11 +233,25 @@ func TestReplyCarriesNewSessionButton(t *testing.T) {
 	if len(sent) != 2 {
 		t.Fatalf("want 2 messages, got %+v", sent)
 	}
-	if !strings.Contains(sent[0].ReplyMarkup, callbackNewSession) {
-		t.Errorf("answer must carry the new-session button, got %+v", sent[0])
+	if !strings.Contains(sent[0].ReplyMarkup, feedbackLike) || !strings.Contains(sent[0].ReplyMarkup, feedbackDislike) {
+		t.Errorf("answer must carry the 👍/👎 buttons, got %+v", sent[0])
 	}
 	if sent[1].ReplyMarkup != "" {
 		t.Errorf("refusal must not carry a keyboard, got %+v", sent[1])
+	}
+}
+
+// TestReplyOmitsFeedbackWhenTracingDisabled: no tracer means no span to
+// annotate, so no feedback affordance is shown.
+func TestReplyOmitsFeedbackWhenTracingDisabled(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, Echo())
+
+	process(b, update(1, 100, "привет"))
+
+	sent := f.sentMessages()
+	if len(sent) != 1 || sent[0].ReplyMarkup != "" {
+		t.Fatalf("want an answer with no keyboard when tracing is off, got %+v", sent)
 	}
 }
 
@@ -226,46 +270,50 @@ func callbackUpdate(id, userID, chatID int64, data string) *models.Update {
 	}
 }
 
-// TestNewSessionCallbackResetsAndConfirms: a button press from an allowed
-// user fires the reset hook and answers with the confirmation.
-func TestNewSessionCallbackResetsAndConfirms(t *testing.T) {
+// TestFeedbackCallbackRecordsAndClearsButtons: a 👍 press from an allowed user
+// fires the feedback hook with the rating and the span id carried in the
+// callback data, then removes the buttons so the vote is one-shot.
+func TestFeedbackCallbackRecordsAndClearsButtons(t *testing.T) {
 	f := newFakeAPI(t)
 	b := newTestBot(t, f, Echo())
-	var resetChat int64
-	b.OnNewSession(func(_ context.Context, chatID int64) error {
-		resetChat = chatID
+	var gotRating, gotSpan string
+	var gotUser int64
+	b.OnFeedback(func(_ context.Context, spanID, rating string, userID, _ int64) error {
+		gotSpan, gotRating, gotUser = spanID, rating, userID
 		return nil
 	})
 
-	process(b, callbackUpdate(1, 100, 100, callbackNewSession))
+	process(b, callbackUpdate(1, 100, 100, feedbackLike+"0123456789abcdef"))
 
-	if resetChat != 100 {
-		t.Errorf("reset hook got chat %d, want 100", resetChat)
+	if gotRating != ratingLike || gotSpan != "0123456789abcdef" || gotUser != 100 {
+		t.Errorf("hook got rating=%q span=%q user=%d, want like/0123456789abcdef/100", gotRating, gotSpan, gotUser)
 	}
-	sent := f.sentMessages()
-	if len(sent) != 1 || !strings.Contains(sent[0].Text, "Начали заново") {
-		t.Fatalf("want reset confirmation, got %+v", sent)
+	// The buttons are cleared via editMessageReplyMarkup with empty markup.
+	edited := f.editedMessages()
+	if len(edited) != 1 || edited[0].ChatID != 100 || edited[0].ReplyMarkup != "" {
+		t.Fatalf("want buttons cleared on chat 100, got %+v", edited)
 	}
-	if sent[0].ReplyMarkup != "" {
-		t.Errorf("confirmation must not carry a keyboard, got %+v", sent[0])
+	// No new message — the rating is silent apart from the toast.
+	if sent := f.sentMessages(); len(sent) != 0 {
+		t.Fatalf("feedback must not send a message, got %+v", sent)
 	}
 }
 
-// TestNewSessionCallbackFromStrangerIgnored: allowlist applies to button
-// presses too — no reset, no reply.
-func TestNewSessionCallbackFromStrangerIgnored(t *testing.T) {
+// TestFeedbackCallbackFromStrangerIgnored: allowlist applies to button presses
+// too — no recording, no edit.
+func TestFeedbackCallbackFromStrangerIgnored(t *testing.T) {
 	f := newFakeAPI(t)
 	b := newTestBot(t, f, Echo())
-	reset := false
-	b.OnNewSession(func(context.Context, int64) error { reset = true; return nil })
+	recorded := false
+	b.OnFeedback(func(context.Context, string, string, int64, int64) error { recorded = true; return nil })
 
-	process(b, callbackUpdate(1, 999, 999, callbackNewSession))
+	process(b, callbackUpdate(1, 999, 999, feedbackLike+"0123456789abcdef"))
 
-	if reset {
-		t.Error("stranger's callback must not reset a session")
+	if recorded {
+		t.Error("stranger's callback must not record feedback")
 	}
-	if sent := f.sentMessages(); len(sent) != 0 {
-		t.Fatalf("want no replies, got %+v", sent)
+	if edited := f.editedMessages(); len(edited) != 0 {
+		t.Fatalf("want no edits, got %+v", edited)
 	}
 }
 

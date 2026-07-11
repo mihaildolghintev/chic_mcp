@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"mcp.chic.md/internal/llm"
 	"mcp.chic.md/internal/mcpserver"
 	"mcp.chic.md/internal/moysklad"
+	"mcp.chic.md/internal/phoenix"
 	"mcp.chic.md/internal/store"
 	"mcp.chic.md/internal/telegram"
 	"mcp.chic.md/internal/tracing"
@@ -243,7 +245,7 @@ func runBot() {
 	// right below, before any update is served.
 	var bot *telegram.Bot
 	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (string, error) {
-		// /new works the same as the inline button: forget the dialog.
+		// /new forgets the dialog so the next question starts from a clean slate.
 		if cmd, _, _ := strings.Cut(strings.TrimSpace(msg.Text), "@"); cmd == "/new" {
 			if err := ag.Reset(ctx, msg.From.ID); err != nil {
 				return "", fmt.Errorf("reset session: %w", err)
@@ -274,7 +276,30 @@ func runBot() {
 		slog.Error("telegram init failed (bad TELEGRAM_BOT_TOKEN?)", "err", err)
 		os.Exit(1)
 	}
-	bot.OnNewSession(ag.Reset)
+	// A 👍/👎 under an answer becomes a HUMAN annotation on that answer's root
+	// span in Phoenix, so an audit can filter the trace list to the thumbs-down
+	// dialogs. Best-effort: a failed write is logged, never surfaced to the user.
+	// Disabled (no PHOENIX_COLLECTOR_ENDPOINT) the hook is a no-op.
+	feedback := phoenix.NewFromEnv(slog.Default())
+	bot.OnFeedback(func(ctx context.Context, spanID, rating string, userID, chatID int64) error {
+		label, score := "thumbs_up", 1.0
+		if rating == "dislike" {
+			label, score = "thumbs_down", 0
+		}
+		return feedback.Annotate(ctx, phoenix.Annotation{
+			SpanID:     spanID,
+			Name:       "user_feedback",
+			Label:      label,
+			Score:      score,
+			Identifier: strconv.FormatInt(userID, 10) + ":" + spanID,
+			Metadata: map[string]string{
+				"user_id": strconv.FormatInt(userID, 10),
+				"chat_id": strconv.FormatInt(chatID, 10),
+				"source":  "telegram",
+			},
+		})
+	})
+
 	// The /memory command reads and prunes the user's durable preferences. Adapt
 	// the agent's store-backed methods to the bot's package-local MemoryItem.
 	bot.OnMemory(
