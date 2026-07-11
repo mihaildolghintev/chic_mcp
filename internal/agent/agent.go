@@ -18,10 +18,14 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"mcp.chic.md/internal/llm"
 	"mcp.chic.md/internal/store"
+	"mcp.chic.md/internal/tracing"
 )
 
 // Friendly replies for the failure modes a user can do something about.
@@ -172,6 +176,29 @@ func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
 // (or the photo caption), imageDataURI is a base64 data URI when the message
 // carries a photo. The returned string is always safe to send to the user.
 func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI string) (string, error) {
+	ctx, span := tracing.Tracer().Start(ctx, "agent.handle")
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindAgent),
+		attribute.Int64("user_id", userID),
+		attribute.Bool("has_image", imageDataURI != ""),
+		tracing.Input(text),
+	)
+
+	answer, err := a.handle(ctx, span, userID, text, imageDataURI)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return answer, err
+	}
+	span.SetAttributes(tracing.Output(answer))
+	return answer, nil
+}
+
+// handle runs the agentic loop for one message; Handle wraps it in the AGENT
+// span. The span is threaded in so the loop can annotate it with the round and
+// token totals once the answer is known.
+func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text, imageDataURI string) (string, error) {
 	if !a.allow(userID) {
 		return msgRateLimited, nil
 	}
@@ -230,6 +257,10 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 		if len(resp.Message.ToolCalls) == 0 {
 			answer := strings.TrimSpace(resp.Message.Text)
 			a.remember(ctx, log, userID, stored, answer)
+			span.SetAttributes(
+				attribute.Int("agent.rounds", round+1),
+				attribute.Int("llm.token_count.total", spent),
+			)
 			log.Info("agent answered", "rounds", round+1, "tokens", spent, "provider", resp.Provider)
 			return answer, nil
 		}
@@ -275,12 +306,30 @@ func (a *Agent) forceFinalAnswer(ctx context.Context, log *slog.Logger, userID i
 // the store (they need the live user id and mutate state the MCP server does
 // not own); everything else goes to the in-process MoySklad MCP server.
 func (a *Agent) dispatchTool(ctx context.Context, userID int64, tc llm.ToolCall) string {
+	ctx, span := tracing.Tracer().Start(ctx, "tool."+tc.Function.Name)
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindTool),
+		tracing.ToolName(tc.Function.Name),
+		tracing.ToolParams(tc.Function.Arguments),
+	)
+	if tc.Function.Arguments != "" {
+		span.SetAttributes(tracing.InputJSON(tc.Function.Arguments)...)
+	}
+
+	var out string
 	switch tc.Function.Name {
 	case toolRememberPreference, toolForgetPreference:
-		return a.callMemoryTool(ctx, userID, tc)
+		out = a.callMemoryTool(ctx, userID, tc)
 	default:
-		return a.callTool(ctx, tc)
+		out = a.callTool(ctx, tc)
 	}
+
+	span.SetAttributes(tracing.Output(out))
+	if strings.HasPrefix(out, "ERROR") {
+		span.SetStatus(codes.Error, "tool returned error")
+	}
+	return out
 }
 
 // callTool executes one MCP tool call. Failures come back as text for the
