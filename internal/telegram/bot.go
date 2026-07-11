@@ -16,6 +16,9 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"go.opentelemetry.io/otel/attribute"
+
+	"mcp.chic.md/internal/tracing"
 )
 
 // Handler processes one allowed message and returns the reply text. The bot
@@ -201,12 +204,26 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 
+	// Root span for the whole delivery: it parents the photo download, the
+	// worker-pool hop and the agent's own spans, so a trace covers Telegram→agent
+	// end to end instead of starting at the LLM. No-op when tracing is disabled.
+	ctx, span := tracing.Tracer().Start(ctx, "telegram.message")
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindChain),
+		attribute.Int64("update_id", u.ID),
+		attribute.Int64("user_id", msg.From.ID),
+		attribute.Int64("chat_id", msg.Chat.ID),
+		attribute.Bool("has_photo", len(msg.Photo) > 0),
+	)
+
 	// Agent answers take seconds to minutes; keep the "typing…" indicator
 	// alive (Telegram drops it after ~5s) until the handler returns.
 	stopTyping := b.startTyping(ctx, msg.Chat.ID)
 	text, err := b.handler.Handle(ctx, msg)
 	stopTyping()
 	if err != nil {
+		span.RecordError(err)
 		log.Error("handler failed", "err", err)
 		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", false)
 		return
@@ -373,6 +390,14 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 	}
 	chatID := q.Message.Message.Chat.ID
 	b.reply(ctx, log, chatID, "❓ "+question, false)
+
+	ctx, span := tracing.Tracer().Start(ctx, "telegram.quick_reply")
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindChain),
+		attribute.Int64("user_id", q.From.ID),
+		attribute.Int64("chat_id", chatID),
+	)
 
 	synthetic := &models.Message{From: &q.From, Chat: q.Message.Message.Chat, Text: question}
 	stopTyping := b.startTyping(ctx, chatID)

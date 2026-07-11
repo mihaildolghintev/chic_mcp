@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"mcp.chic.md/internal/tracing"
 )
 
 // DefaultBaseURL is the MoySklad JSON API 1.2 root.
@@ -48,7 +50,13 @@ func NewClient(token string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    DefaultBaseURL,
 		token:      token,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		// Instrumented transport: each MoySklad call becomes a child HTTP span
+		// under the TOOL span, separating upstream latency from our own. A no-op
+		// when tracing is disabled.
+		httpClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: tracing.NewTransport(http.DefaultTransport),
+		},
 		limiter:    rate.NewLimiter(rate.Limit(15), 45), // 45 / 3s == 15/s sustained
 		maxRetries: 3,
 		baseDelay:  500 * time.Millisecond,

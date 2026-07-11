@@ -13,9 +13,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"mcp.chic.md/internal/tracing"
 )
@@ -47,8 +49,13 @@ func New(providers ...Provider) (*Client, error) {
 	}
 	return &Client{
 		providers: providers,
-		// A generous backstop; per-request deadlines come from ctx.
-		http: &http.Client{Timeout: 3 * time.Minute},
+		// A generous backstop; per-request deadlines come from ctx. The transport
+		// is instrumented so each completion's HTTP round trip shows up as a child
+		// span (a no-op when tracing is disabled).
+		http: &http.Client{
+			Timeout:   3 * time.Minute,
+			Transport: tracing.NewTransport(http.DefaultTransport),
+		},
 	}, nil
 }
 
@@ -141,9 +148,7 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 		tracing.ModelName(p.Model),
 		tracing.Provider(p.Name),
 	)
-	if in, err := json.Marshal(req.Messages); err == nil {
-		span.SetAttributes(tracing.InputJSON(string(in))...)
-	}
+	recordPromptIn(span, p, req)
 
 	resp, err := c.chat(ctx, p, req)
 	if err != nil {
@@ -152,10 +157,68 @@ func (c *Client) Chat(ctx context.Context, req Request) (*Response, error) {
 		return nil, err
 	}
 	span.SetAttributes(tracing.Tokens(resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)...)
-	if out, err := json.Marshal(resp.Message); err == nil {
+	recordPromptOut(span, resp.Message)
+	return resp, nil
+}
+
+// recordPromptIn lays the full request onto the LLM span the way Phoenix reads
+// it: the raw blob (input.value), then every message as an indexed card, the
+// tool calls carried on assistant/tool turns, the tools offered to the model,
+// and the invocation parameters. This is what makes a prompt inspectable and
+// diffable in the UI rather than an opaque string.
+func recordPromptIn(span trace.Span, p *Provider, req Request) {
+	if in, err := json.Marshal(req.Messages); err == nil {
+		span.SetAttributes(tracing.InputJSON(string(in))...)
+	}
+	for i, m := range req.Messages {
+		span.SetAttributes(tracing.InputMessage(i, m.Role, messageContent(m))...)
+		for j, tc := range m.ToolCalls {
+			span.SetAttributes(tracing.InputMessageToolCall(i, j, tc.Function.Name, tc.Function.Arguments)...)
+		}
+	}
+	for i, t := range req.Tools {
+		if schema, err := json.Marshal(t); err == nil {
+			span.SetAttributes(tracing.ToolSchema(i, string(schema)))
+		}
+	}
+	params := map[string]any{"model": p.Model}
+	if req.MaxTokens > 0 {
+		params["max_tokens"] = req.MaxTokens
+	}
+	if b, err := json.Marshal(params); err == nil {
+		span.SetAttributes(tracing.InvocationParameters(string(b)))
+	}
+}
+
+// recordPromptOut records the completion message: the raw blob plus the
+// assistant turn as an output-message card with any tool calls it requested.
+func recordPromptOut(span trace.Span, msg Message) {
+	if out, err := json.Marshal(msg); err == nil {
 		span.SetAttributes(tracing.OutputJSON(string(out))...)
 	}
-	return resp, nil
+	span.SetAttributes(tracing.OutputMessage(0, msg.Role, msg.Text)...)
+	for j, tc := range msg.ToolCalls {
+		span.SetAttributes(tracing.OutputMessageToolCall(0, j, tc.Function.Name, tc.Function.Arguments)...)
+	}
+}
+
+// messageContent renders a message's text for a span card: the plain Text, or
+// the text parts of a multimodal message with a marker where an image sits (the
+// base64 data URI itself would bloat the span and isn't useful to read).
+func messageContent(m Message) string {
+	if len(m.Parts) == 0 {
+		return m.Text
+	}
+	var b strings.Builder
+	for _, part := range m.Parts {
+		switch part.Type {
+		case "text":
+			b.WriteString(part.Text)
+		case "image_url":
+			b.WriteString("[image]")
+		}
+	}
+	return b.String()
 }
 
 // chat runs one completion against an already-picked provider.

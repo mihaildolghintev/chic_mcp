@@ -5,8 +5,11 @@ import (
 	"log/slog"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"mcp.chic.md/internal/llm"
 	"mcp.chic.md/internal/store"
+	"mcp.chic.md/internal/tracing"
 )
 
 // Keeping a long dialog in the prompt is what "переполнение окна" means here:
@@ -71,6 +74,15 @@ func (a *Agent) summarize(ctx context.Context, msgs []store.Message) string {
 	if len(msgs) == 0 {
 		return ""
 	}
+	// A named span so the history-condense LLM call is distinguishable in Phoenix
+	// from the main answer's completions instead of being an anonymous llm.* span.
+	ctx, span := tracing.Tracer().Start(ctx, "history.summarize")
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindChain),
+		attribute.Int("summarized_turns", len(msgs)),
+	)
+
 	var b strings.Builder
 	for _, m := range msgs {
 		who := "Пользователь"
