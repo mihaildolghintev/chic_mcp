@@ -211,6 +211,9 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	defer span.End()
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindChain),
+		// The question on the root span so the trace list reads as a dialog line,
+		// not an empty structural row (the full prompt still lives on the LLM span).
+		tracing.Input(messageQuestion(msg)),
 		attribute.Int64("update_id", u.ID),
 		attribute.Int64("user_id", msg.From.ID),
 		attribute.Int64("chat_id", msg.Chat.ID),
@@ -228,10 +231,26 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", false)
 		return
 	}
+	span.SetAttributes(tracing.Output(text))
 	if text == "" {
 		return
 	}
 	b.reply(ctx, log, msg.Chat.ID, text, true)
+}
+
+// messageQuestion is the user's text for a trace's root span: the message text,
+// or the photo caption, with a marker when a photo carries no caption.
+func messageQuestion(msg *models.Message) string {
+	if msg.Text != "" {
+		return msg.Text
+	}
+	if msg.Caption != "" {
+		return "[фото] " + msg.Caption
+	}
+	if len(msg.Photo) > 0 {
+		return "[фото]"
+	}
+	return ""
 }
 
 // parseCommand extracts a leading "/command" token from message text, stripping
@@ -395,6 +414,7 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 	defer span.End()
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindChain),
+		tracing.Input(question),
 		attribute.Int64("user_id", q.From.ID),
 		attribute.Int64("chat_id", chatID),
 	)
@@ -404,10 +424,12 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 	text, err := b.handler.Handle(ctx, synthetic)
 	stopTyping()
 	if err != nil {
+		span.RecordError(err)
 		log.Error("quick-reply handler failed", "err", err)
 		b.reply(ctx, log, chatID, "Что-то пошло не так, попробуйте ещё раз.", false)
 		return
 	}
+	span.SetAttributes(tracing.Output(text))
 	if text == "" {
 		return
 	}
