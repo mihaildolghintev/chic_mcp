@@ -37,8 +37,8 @@ func TestHandle_SummarizesOverflowingHistory(t *testing.T) {
 		final("СВОДКА: пользователь спрашивал про продажи.", 30), // the condense call
 		final("Итоговый ответ.", 20),                             // the real answer
 	}}
-	a, st := newTestAgent(t, script, &fakeAPI{}, Options{})
-	seedHistory(t, st, 7, 10) // 10 turns × ~1KB ≫ 8000-char budget
+	a, st := newTestAgent(t, script, &fakeAPI{}, Options{SummaryCharBudget: 8000})
+	seedHistory(t, st, 7, 10) // 10 turns × ~1K runes ≫ 8000-rune budget
 
 	res, err := a.Handle(context.Background(), 7, "новый вопрос", "")
 	if err != nil {
@@ -100,6 +100,49 @@ func TestHandle_ShortHistoryNotSummarized(t *testing.T) {
 	}
 	if len(script.requests) != 1 {
 		t.Fatalf("short history triggered an extra call: %d requests", len(script.requests))
+	}
+}
+
+// TestHandle_ReusesPersistedSummary: once the older turns are folded into the
+// stored summary, a later request reuses it instead of summarizing again — the
+// win of a persisted rolling summary over re-condensing every request.
+func TestHandle_ReusesPersistedSummary(t *testing.T) {
+	script := &scriptedLLM{responses: []string{
+		final("СВОДКА: ранние продажи.", 30), // request 0: the fold call
+		final("ответ 1", 20),                 // request 1: first answer
+		final("ответ 2", 20),                 // request 2: second answer, no new fold
+	}}
+	a, st := newTestAgent(t, script, &fakeAPI{}, Options{SummaryCharBudget: 8000})
+	ctx := context.Background()
+	seedHistory(t, st, 7, 10) // overflows the budget → first Handle folds
+
+	if _, err := a.Handle(ctx, 7, "вопрос 1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(script.requests) != 2 {
+		t.Fatalf("first Handle: want fold+answer = 2 requests, got %d", len(script.requests))
+	}
+	// The summary was persisted for this session (epoch 0 — no /new happened).
+	if sum, up, err := st.GetSessionSummary(ctx, 7, 0); err != nil || sum == "" || up == 0 {
+		t.Fatalf("summary not persisted: %q, %d, %v", sum, up, err)
+	}
+
+	if _, err := a.Handle(ctx, 7, "вопрос 2", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Second Handle must NOT summarize again — only the answer call is made.
+	if len(script.requests) != 3 {
+		t.Fatalf("second Handle re-summarized: want 3 total requests, got %d", len(script.requests))
+	}
+	// The reused summary still rides along in the second answer's prompt.
+	var haveSummary bool
+	for _, m := range script.requests[2]["messages"].([]any) {
+		if c, _ := m.(map[string]any)["content"].(string); strings.Contains(c, "Краткое содержание") && strings.Contains(c, "СВОДКА") {
+			haveSummary = true
+		}
+	}
+	if !haveSummary {
+		t.Error("second answer prompt missing the reused summary")
 	}
 }
 

@@ -61,9 +61,10 @@ type Options struct {
 	RatePerHour  int           // per-user requests per hour, 0 = default 30, <0 = unlimited
 	Timeout      time.Duration // wall-clock cap per request (default 3m)
 
-	// SummaryCharBudget is the total size (in chars) of replayed history above
-	// which older turns are folded into an LLM summary instead of replayed
-	// verbatim. 0 = default 8000; <0 disables summarization.
+	// SummaryCharBudget is the total size (in characters/runes) of replayed
+	// history above which older turns are folded into an LLM summary instead of
+	// replayed verbatim. 0 = default 300_000 (≈128K tokens, comfortably inside
+	// deepseek-v4-flash's 1M window); <0 disables summarization entirely.
 	SummaryCharBudget int
 
 	// CurrencyCode and CurrencyName label monetary amounts in the system
@@ -98,7 +99,7 @@ func (o Options) withDefaults() Options {
 		o.Timeout = 3 * time.Minute
 	}
 	if o.SummaryCharBudget == 0 {
-		o.SummaryCharBudget = 8000
+		o.SummaryCharBudget = 300_000
 	}
 	return o
 }
@@ -170,6 +171,15 @@ func (a *Agent) Reset(ctx context.Context, userID int64) error {
 	return a.store.StartSession(ctx, userID)
 }
 
+// sessionID is the Phoenix session.id for a dialog: "<userID>:<epoch>", where
+// epoch is the id of the session's boundary (the last /new, 0 before the first).
+// It rolls over with the epoch so a fresh dialog opens a fresh Phoenix Session,
+// while distinct users never share one. Only /new moves the epoch — context is
+// never dropped on a timer, so a conversation resumed hours later continues.
+func sessionID(userID, epoch int64) string {
+	return strconv.FormatInt(userID, 10) + ":" + strconv.FormatInt(epoch, 10)
+}
+
 // convertTools turns MCP tool schemas into OpenAI function definitions — the
 // schemas are already JSON Schema objects, so this is a rename, not a mapping.
 func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
@@ -199,16 +209,24 @@ func convertTools(in []mcp.Tool) ([]llm.Tool, error) {
 func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI string) (Result, error) {
 	ctx, span := tracing.Tracer().Start(ctx, "agent.handle")
 	defer span.End()
+
+	log := slog.Default().With("user_id", userID)
+	// epoch identifies the session; sessionID groups the whole dialog into one
+	// Phoenix Session and changes only on /new. Best-effort telemetry: on a
+	// lookup failure fall back to epoch 0 grouping.
+	epoch, err := a.store.SessionEpoch(ctx, userID)
+	if err != nil {
+		log.Warn("session epoch read failed, grouping under epoch 0", "err", err)
+	}
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindAgent),
-		// session.id groups a user's whole conversation into one Phoenix Session.
-		tracing.SessionID(strconv.FormatInt(userID, 10)),
+		tracing.SessionID(sessionID(userID, epoch)),
 		attribute.Int64("user_id", userID),
 		attribute.Bool("has_image", imageDataURI != ""),
 		tracing.Input(text),
 	)
 
-	res, err := a.handle(ctx, span, userID, text, imageDataURI)
+	res, err := a.handle(ctx, span, log, userID, epoch, text, imageDataURI)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -221,7 +239,7 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 // handle runs the agentic loop for one message; Handle wraps it in the AGENT
 // span. The span is threaded in so the loop can annotate it with the round and
 // token totals once the answer is known.
-func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text, imageDataURI string) (Result, error) {
+func (a *Agent) handle(ctx context.Context, span trace.Span, log *slog.Logger, userID, epoch int64, text, imageDataURI string) (Result, error) {
 	if !a.allow(userID) {
 		return Result{Text: msgRateLimited}, nil
 	}
@@ -231,14 +249,8 @@ func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text,
 	ctx, cancel := context.WithTimeout(ctx, a.opts.Timeout)
 	defer cancel()
 
-	log := slog.Default().With("user_id", userID)
-
-	// Both reads are context, not correctness — a failure degrades to a
-	// memoryless answer instead of an error.
-	history, err := a.store.RecentMessages(ctx, userID, a.opts.HistoryDepth)
-	if err != nil {
-		log.Warn("history read failed, answering without it", "err", err)
-	}
+	// Context reads are best-effort — a failure degrades to a thinner prompt
+	// instead of an error.
 	prefs, err := a.store.Preferences(ctx, userID)
 	if err != nil {
 		log.Warn("preferences read failed, answering without them", "err", err)
@@ -251,9 +263,17 @@ func (a *Agent) handle(ctx context.Context, span trace.Span, userID int64, text,
 		stored = strings.TrimSpace("[фото] " + text)
 	}
 
-	// Fold an overflowing history into a short summary so a long conversation
-	// keeps its context without blowing the window on every request.
-	summary, history := a.condenseHistory(ctx, log, history)
+	// Fold the session's older turns into a persisted rolling summary so a long
+	// conversation keeps its context without blowing the window on every request.
+	summary, history := a.condenseHistory(ctx, log, userID, epoch)
+	if summary != "" {
+		// Surface memory loss at the session root so Phoenix can slice answers by
+		// whether the model was working from condensed context.
+		span.SetAttributes(
+			attribute.Bool("session.compacted", true),
+			attribute.Int("session.summary_chars", len(summary)),
+		)
+	}
 
 	msgs := make([]llm.Message, 0, len(history)+3)
 	msgs = append(msgs, llm.System(systemPrompt(time.Now(), a.opts.CurrencyCode, a.opts.CurrencyName, prefs)))

@@ -231,8 +231,9 @@ func runBot() {
 	curCode, curName := resolveCurrency(ctx, api)
 
 	ag, err := agent.New(ctx, llmClient, mcpserver.New(api), appDB, agent.Options{
-		CurrencyCode: curCode,
-		CurrencyName: curName,
+		CurrencyCode:      curCode,
+		CurrencyName:      curName,
+		SummaryCharBudget: envInt("SUMMARY_CHAR_BUDGET", 0), // 0 → agent default; <0 disables
 	})
 	if err != nil {
 		slog.Error("agent init", "err", err)
@@ -442,4 +443,20 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt parses key as an integer. Unset or unparseable falls back to def, so a
+// typo can't silently change behaviour — it keeps the built-in default (logged
+// so the deploy is visible).
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("ignoring unparseable int env var", "var", key, "value", v, "err", err)
+		return def
+	}
+	return n
 }

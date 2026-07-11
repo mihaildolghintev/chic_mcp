@@ -69,15 +69,22 @@ func FromEnv() (*Client, error) {
 			Name:    "deepseek",
 			BaseURL: envOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
 			APIKey:  key,
-			Model:   envOr("DEEPSEEK_MODEL", "deepseek-chat"),
+			// deepseek-v4-flash (1M context, 384K max output). The old
+			// deepseek-chat / deepseek-reasoner names are deprecated 2026-07-24;
+			// they mapped to this model's non-thinking / thinking modes.
+			Model: envOr("DEEPSEEK_MODEL", "deepseek-v4-flash"),
 		})
 	}
 	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 		providers = append(providers, Provider{
-			Name:           "openai",
-			BaseURL:        envOr("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-			APIKey:         key,
-			Model:          envOr("OPENAI_MODEL", "gpt-4o"),
+			Name:    "openai",
+			BaseURL: envOr("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+			APIKey:  key,
+			// This provider serves the bot's photo requests, so the model must
+			// accept image input — SupportsVision routes them here. gpt-4o was
+			// retired; gpt-5.4-mini is the cheap current default. Override with
+			// OPENAI_MODEL if you pick a different vision-capable model.
+			Model:          envOr("OPENAI_MODEL", "gpt-5.4-mini"),
 			SupportsVision: true,
 		})
 	}
