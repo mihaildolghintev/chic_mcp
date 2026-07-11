@@ -296,7 +296,7 @@ func Stock(rows []moysklad.StockRow) []StockLine {
 			CostPrice:  cost,
 			SalePrice:  MinorToMajor(r.SalePrice),
 			StockValue: round2(r.Stock * cost),
-			StockDays:  r.StockDays,
+			StockDays:  int(r.StockDays),
 		})
 	}
 	return out

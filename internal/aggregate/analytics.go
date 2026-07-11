@@ -283,7 +283,7 @@ type DeadStockLine struct {
 func DeadStock(rows []moysklad.StockRow, outcomeByRef map[string]float64, thresholdDays int) []DeadStockLine {
 	var out []DeadStockLine
 	for _, r := range rows {
-		if r.Stock <= 0 || r.StockDays < thresholdDays {
+		if r.Stock <= 0 || r.StockDays < float64(thresholdDays) {
 			continue
 		}
 		outcome := 0.0

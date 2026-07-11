@@ -213,3 +213,24 @@ func TestDoGet_ClientErrorNoRetry(t *testing.T) {
 		t.Errorf("made %d calls, want 1 (4xx must not retry)", calls)
 	}
 }
+
+// TestGetStock_FractionalStockDays guards the decode regression that broke
+// every stock tool (dead_stock, get_stock): MoySklad returns stockDays as a
+// fractional number, so StockRow.StockDays must be float64, not int.
+func TestGetStock_FractionalStockDays(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"meta":{"size":1},"rows":[` +
+			`{"name":"Old stock","stock":10,"stockDays":410.44}]}`))
+	})
+
+	rows, err := c.GetStock(context.Background(), StockOptions{})
+	if err != nil {
+		t.Fatalf("GetStock: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].StockDays != 410.44 {
+		t.Errorf("StockDays = %v, want 410.44", rows[0].StockDays)
+	}
+}

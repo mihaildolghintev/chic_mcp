@@ -190,7 +190,10 @@ type StockRow struct {
 	Reserve   float64 `json:"reserve"`
 	InTransit float64 `json:"inTransit"`
 	Quantity  float64 `json:"quantity"`
-	StockDays int     `json:"stockDays"`
+	// StockDays: the API doc declares this Int, but the live report returns a
+	// fractional number (e.g. 410.44), so we must decode float64 — int fails
+	// the whole /report/stock/all unmarshal. Do NOT "fix" back to int per docs.
+	StockDays float64 `json:"stockDays"`
 }
 
 // GetStock fetches the extended stock report. When opts.StoreID is set the
