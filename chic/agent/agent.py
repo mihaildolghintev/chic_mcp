@@ -196,6 +196,11 @@ class ChicAgent:
     def has_vision(self) -> bool:
         return self._vision_model is not None
 
+    def set_currency(self, code: str, name: str) -> None:
+        """Update the account currency labels (resolved lazily after startup)."""
+        self._currency_code = code
+        self._currency_name = name
+
     @classmethod
     async def create(
         cls,
