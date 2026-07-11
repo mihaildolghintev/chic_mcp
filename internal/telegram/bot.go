@@ -18,29 +18,38 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-// Handler processes one allowed message and returns the reply text. The bot
-// owns allowlist checks and reply delivery, so a Handler is pure
-// message-in/text-out — the echo handler today, the LLM agent later.
+// Reply is what a Handler produces: a final answer (Options == nil) or a
+// clarifying question (Options non-empty) the bot renders as an inline
+// keyboard. AllowCustom adds a free-text "свой вариант" button.
+type Reply struct {
+	Text        string
+	Options     []string
+	AllowCustom bool
+}
+
+// Handler processes one allowed message and returns a Reply. The bot owns
+// allowlist checks and delivery, so a Handler is pure message-in/reply-out —
+// the echo handler today, the LLM agent later.
 type Handler interface {
-	Handle(ctx context.Context, msg *models.Message) (string, error)
+	Handle(ctx context.Context, msg *models.Message) (Reply, error)
 }
 
 // HandlerFunc adapts a function to the Handler interface.
-type HandlerFunc func(ctx context.Context, msg *models.Message) (string, error)
+type HandlerFunc func(ctx context.Context, msg *models.Message) (Reply, error)
 
 // Handle implements Handler.
-func (f HandlerFunc) Handle(ctx context.Context, msg *models.Message) (string, error) {
+func (f HandlerFunc) Handle(ctx context.Context, msg *models.Message) (Reply, error) {
 	return f(ctx, msg)
 }
 
 // Echo replies with the incoming text verbatim — the skeleton handler that
 // proves the receive→process→reply loop before any AI is attached.
 func Echo() Handler {
-	return HandlerFunc(func(_ context.Context, msg *models.Message) (string, error) {
+	return HandlerFunc(func(_ context.Context, msg *models.Message) (Reply, error) {
 		if len(msg.Photo) > 0 {
-			return "картинки будут позже", nil
+			return Reply{Text: "картинки будут позже"}, nil
 		}
-		return msg.Text, nil
+		return Reply{Text: msg.Text}, nil
 	})
 }
 
@@ -53,6 +62,14 @@ const (
 	// handler in main answers with the same wording as the button.
 	MsgSessionReset = "🆕 Начали заново — прошлый диалог больше не учитывается."
 	msgResetFailed  = "Не получилось сбросить контекст, попробуйте ещё раз."
+
+	// Clarifying-question buttons. callback_data is capped at 64 bytes, so an
+	// option button carries only its index (ask:0, ask:1, …) and the label is
+	// recovered from the button itself on callback. ask:custom is the
+	// "свой вариант" button — the free-text answer arrives as the next message.
+	callbackAskPrefix = "ask:"
+	callbackAskCustom = "ask:custom"
+	msgAskCustom      = "Напишите свой вариант ответом 👇"
 )
 
 var newSessionKeyboard = &models.InlineKeyboardMarkup{
@@ -177,32 +194,45 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 
+	b.handleMessage(ctx, log, msg)
+}
+
+// handleMessage runs one allowed message through the handler and delivers the
+// result: a plain answer, or a clarifying question as an inline keyboard. It is
+// the shared path for real messages and for resuming after an inline choice,
+// so both get the typing indicator and question rendering.
+func (b *Bot) handleMessage(ctx context.Context, log *slog.Logger, msg *models.Message) {
 	// Agent answers take seconds to minutes; keep the "typing…" indicator
 	// alive (Telegram drops it after ~5s) until the handler returns.
 	stopTyping := b.startTyping(ctx, msg.Chat.ID)
-	text, err := b.handler.Handle(ctx, msg)
+	rep, err := b.handler.Handle(ctx, msg)
 	stopTyping()
 	if err != nil {
 		log.Error("handler failed", "err", err)
 		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", false)
 		return
 	}
-	if text == "" {
+	if len(rep.Options) > 0 {
+		b.askQuestion(ctx, log, msg.Chat.ID, rep)
 		return
 	}
-	b.reply(ctx, log, msg.Chat.ID, text, true)
+	if rep.Text == "" {
+		return
+	}
+	b.reply(ctx, log, msg.Chat.ID, rep.Text, true)
 }
 
 // onCallback handles an inline-button press. The only button today is
 // "new dialog", which resets the agent's memory for the chat.
 func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	log := b.logger.With("callback_id", q.ID, "user_id", q.From.ID)
-	// Always ack, even on the ignore paths — otherwise the client spins.
-	defer func() {
-		if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
-			log.Debug("answerCallbackQuery failed", "err", err)
-		}
-	}()
+	// Ack up front, before any handler work — an ask: resume runs the full
+	// agent loop (seconds to minutes), and Telegram expires the callback (and
+	// spins the button) if the ack waits until after that. Acking on every
+	// path, including the ignore ones, is what keeps the client from spinning.
+	if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
+		log.Debug("answerCallbackQuery failed", "err", err)
+	}
 
 	if _, ok := b.allowed[q.From.ID]; !ok {
 		log.Warn("callback from user not in allowlist")
@@ -210,17 +240,146 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	}
 	// Message can be inaccessible when the button is older than 48h — then
 	// there is no chat to answer in, so drop the press.
-	if q.Data != callbackNewSession || q.Message.Message == nil || b.onNewSession == nil {
+	if q.Message.Message == nil {
 		return
 	}
 	chatID := q.Message.Message.Chat.ID
-	if err := b.onNewSession(ctx, chatID); err != nil {
-		log.Error("new session reset failed", "err", err)
-		b.reply(ctx, log, chatID, msgResetFailed, false)
+
+	switch {
+	case strings.HasPrefix(q.Data, callbackAskPrefix):
+		b.onAskAnswer(ctx, log, q)
+	case q.Data == callbackNewSession && b.onNewSession != nil:
+		if err := b.onNewSession(ctx, chatID); err != nil {
+			log.Error("new session reset failed", "err", err)
+			b.reply(ctx, log, chatID, msgResetFailed, false)
+			return
+		}
+		log.Info("new session started", "chat_id", chatID)
+		b.reply(ctx, log, chatID, MsgSessionReset, false)
+	}
+}
+
+// onAskAnswer resumes the dialog after the user taps an inline option under a
+// clarifying question. The chosen label is read back from the pressed button
+// (callback_data only carries the index), the keyboard is removed so the
+// question can't be answered twice, and the choice is fed through the normal
+// message path as the next user turn — the agent resumes from history.
+func (b *Bot) onAskAnswer(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
+	msg := q.Message.Message
+	chatID := msg.Chat.ID
+
+	if q.Data == callbackAskCustom {
+		// The answer is still to come as free text; just drop the keyboard and
+		// nudge. The agent already has the question in history.
+		b.clearKeyboard(ctx, log, chatID, msg.ID)
+		b.reply(ctx, log, chatID, msgAskCustom, false)
 		return
 	}
-	log.Info("new session started", "chat_id", chatID)
-	b.reply(ctx, log, chatID, MsgSessionReset, false)
+
+	label := buttonLabel(msg.ReplyMarkup, q.Data)
+	if label == "" {
+		log.Warn("ask callback with no matching button", "data", q.Data)
+		b.clearKeyboard(ctx, log, chatID, msg.ID)
+		return
+	}
+	// Reflect the choice in the question message (and drop the keyboard) so the
+	// chat shows what was picked, then route the choice through the same path
+	// as a real message — typing indicator, rendering and any follow-up
+	// question all just work.
+	b.markAnswered(ctx, log, chatID, msg.ID, msg.Text, label)
+	b.handleMessage(ctx, log, &models.Message{
+		ID:   msg.ID,
+		From: &q.From,
+		Chat: msg.Chat,
+		Text: label,
+	})
+}
+
+// markAnswered rewrites an answered question to show the chosen option under it
+// and removes the keyboard in the same edit (editMessageText without a markup
+// drops it). Plain text, no parse mode: the question came back from Telegram as
+// plain text, so re-sending it can't reject on entities. Best-effort — a
+// failure just leaves the original question and its (now stale) buttons.
+func (b *Bot) markAnswered(ctx context.Context, log *slog.Logger, chatID int64, msgID int, question, choice string) {
+	text := strings.TrimSpace(question)
+	if text != "" {
+		text += "\n\n"
+	}
+	text += "✅ " + choice
+	if _, err := b.api.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    chatID,
+		MessageID: msgID,
+		Text:      text,
+	}); err != nil {
+		log.Debug("mark answered failed", "err", err)
+		b.clearKeyboard(ctx, log, chatID, msgID)
+	}
+}
+
+// askQuestion sends a clarifying question as an inline keyboard: one button per
+// option (callback ask:<idx>), plus an optional "свой вариант" button. The
+// labels live in the buttons, so the choice is recovered from the callback's
+// own message — no server-side pending-question state.
+func (b *Bot) askQuestion(ctx context.Context, log *slog.Logger, chatID int64, rep Reply) {
+	rows := make([][]models.InlineKeyboardButton, 0, len(rep.Options)+1)
+	for i, opt := range rep.Options {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: opt, CallbackData: fmt.Sprintf("%s%d", callbackAskPrefix, i)},
+		})
+	}
+	if rep.AllowCustom {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: "✏️ Свой вариант", CallbackData: callbackAskCustom},
+		})
+	}
+	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+
+	// Question text can exceed the message limit like any answer; hang the
+	// keyboard under the last chunk.
+	chunks := splitHTML(renderTelegramHTML(rep.Text), maxMessageLen)
+	for i, chunk := range chunks {
+		var m models.ReplyMarkup
+		if i == len(chunks)-1 {
+			m = markup
+		}
+		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:      chatID,
+			Text:        chunk,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: m,
+		}); err != nil {
+			log.Error("sendMessage question failed", "err", err)
+			return
+		}
+	}
+}
+
+// clearKeyboard removes the inline keyboard from a message (its question is now
+// answered). Best-effort: a failure only leaves stale buttons behind.
+func (b *Bot) clearKeyboard(ctx context.Context, log *slog.Logger, chatID int64, msgID int) {
+	if _, err := b.api.EditMessageReplyMarkup(ctx, &bot.EditMessageReplyMarkupParams{
+		ChatID:    chatID,
+		MessageID: msgID,
+	}); err != nil {
+		log.Debug("clear keyboard failed", "err", err)
+	}
+}
+
+// buttonLabel returns the text of the inline button whose callback_data matches.
+// callback_data only carries the option index (the 64-byte cap rules out the
+// label), so the human-readable choice is recovered from the tapped keyboard.
+func buttonLabel(markup *models.InlineKeyboardMarkup, data string) string {
+	if markup == nil {
+		return ""
+	}
+	for _, row := range markup.InlineKeyboard {
+		for _, btn := range row {
+			if btn.CallbackData == data {
+				return btn.Text
+			}
+		}
+	}
+	return ""
 }
 
 // maxMessageLen is Telegram's hard cap on sendMessage text.

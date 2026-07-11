@@ -25,8 +25,10 @@ type fakeAPI struct {
 	srv        *httptest.Server
 	rejectHTML bool
 
-	mu   sync.Mutex
-	sent []sentMessage
+	mu         sync.Mutex
+	sent       []sentMessage
+	edited     int      // editMessageReplyMarkup calls (bare keyboard clears)
+	editedText []string // text of each editMessageText call (answered questions)
 }
 
 type sentMessage struct {
@@ -70,6 +72,22 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 				return
 			}
 			result = map[string]any{"message_id": 1, "date": 0, "chat": map[string]any{"id": m.ChatID}}
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("editMessageText form: %v", err)
+			}
+			chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
+			f.mu.Lock()
+			f.editedText = append(f.editedText, r.FormValue("text"))
+			f.mu.Unlock()
+			// Return an edited Message so the library doesn't error and fall back.
+			result = map[string]any{"message_id": 1, "date": 0,
+				"chat": map[string]any{"id": chatID}, "text": r.FormValue("text")}
+		case strings.HasSuffix(r.URL.Path, "/editMessageReplyMarkup"):
+			f.mu.Lock()
+			f.edited++
+			f.mu.Unlock()
+			result = true
 		case strings.HasSuffix(r.URL.Path, "/setWebhook"),
 			strings.HasSuffix(r.URL.Path, "/setMyCommands"),
 			strings.HasSuffix(r.URL.Path, "/answerCallbackQuery"):
@@ -86,6 +104,18 @@ func (f *fakeAPI) sentMessages() []sentMessage {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]sentMessage(nil), f.sent...)
+}
+
+func (f *fakeAPI) editCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.edited
+}
+
+func (f *fakeAPI) editedTexts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.editedText...)
 }
 
 func newTestBot(t *testing.T, f *fakeAPI, h Handler) *Bot {
@@ -133,8 +163,8 @@ func TestAllowedUserGetsEcho(t *testing.T) {
 // any literal HTML) escaped so Telegram can't reject the parse.
 func TestReplyRendersMarkdownToHTML(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "**итог**: 1 < 2 <script>x</script>", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "**итог**: 1 < 2 <script>x</script>"}, nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
@@ -151,8 +181,8 @@ func TestReplyRendersMarkdownToHTML(t *testing.T) {
 func TestHTMLRejectFallsBackToPlainText(t *testing.T) {
 	f := newFakeAPI(t)
 	f.rejectHTML = true
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "**жирный** текст", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "**жирный** текст"}, nil
 	}))
 
 	process(b, update(1, 100, "отчёт"))
@@ -248,6 +278,97 @@ func TestNewSessionCallbackFromStrangerIgnored(t *testing.T) {
 	}
 }
 
+// askCallbackUpdate is a button press under a clarifying question: the pressed
+// message carries the option keyboard so buttonLabel can recover the label.
+func askCallbackUpdate(id, userID, chatID int64, data string, options []string) *models.Update {
+	rows := make([][]models.InlineKeyboardButton, 0, len(options)+1)
+	for i, opt := range options {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: opt, CallbackData: callbackAskPrefix + strconv.Itoa(i)},
+		})
+	}
+	rows = append(rows, []models.InlineKeyboardButton{
+		{Text: "✏️ Свой вариант", CallbackData: callbackAskCustom},
+	})
+	u := callbackUpdate(id, userID, chatID, data)
+	u.CallbackQuery.Message.Message.Text = "За какой период?"
+	u.CallbackQuery.Message.Message.ReplyMarkup = &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+	return u
+}
+
+// TestClarifyingQuestionRendersKeyboard: a Reply with options goes out as one
+// message whose inline keyboard carries an indexed button per option plus the
+// "свой вариант" button — and no new-session button (it's a question).
+func TestClarifyingQuestionRendersKeyboard(t *testing.T) {
+	f := newFakeAPI(t)
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{Text: "За какой период?", Options: []string{"За неделю", "За месяц"}, AllowCustom: true}, nil
+	}))
+
+	process(b, update(1, 100, "покажи продажи"))
+
+	sent := f.sentMessages()
+	if len(sent) != 1 {
+		t.Fatalf("want 1 question message, got %+v", sent)
+	}
+	mk := sent[0].ReplyMarkup
+	for _, want := range []string{`"ask:0"`, `"ask:1"`, `"ask:custom"`, "За неделю", "За месяц", "Свой вариант"} {
+		if !strings.Contains(mk, want) {
+			t.Errorf("keyboard missing %q, got %s", want, mk)
+		}
+	}
+	if strings.Contains(mk, callbackNewSession) {
+		t.Errorf("question must not carry the new-session button, got %s", mk)
+	}
+}
+
+// TestAskOptionCallbackResumes: tapping an option clears the keyboard and feeds
+// the chosen label back through the handler as the next user turn.
+func TestAskOptionCallbackResumes(t *testing.T) {
+	f := newFakeAPI(t)
+	// Echo the incoming text so the resumed turn's answer is the chosen label.
+	b := newTestBot(t, f, HandlerFunc(func(_ context.Context, msg *models.Message) (Reply, error) {
+		return Reply{Text: "выбрано: " + msg.Text}, nil
+	}))
+
+	process(b, askCallbackUpdate(1, 100, 100, "ask:1", []string{"За неделю", "За месяц"}))
+
+	// The question message is rewritten with the choice (which also drops its
+	// keyboard) — not a bare keyboard clear.
+	edits := f.editedTexts()
+	if len(edits) != 1 || !strings.Contains(edits[0], "За какой период?") || !strings.Contains(edits[0], "✅ За месяц") {
+		t.Fatalf("want question rewritten with choice, got %+v", edits)
+	}
+	sent := f.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "выбрано: За месяц") {
+		t.Fatalf("want resume with chosen label, got %+v", sent)
+	}
+}
+
+// TestAskCustomCallbackNudges: the "свой вариант" button clears the keyboard
+// and asks for a written answer without invoking the agent.
+func TestAskCustomCallbackNudges(t *testing.T) {
+	f := newFakeAPI(t)
+	called := false
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		called = true
+		return Reply{Text: "не должно вызваться"}, nil
+	}))
+
+	process(b, askCallbackUpdate(1, 100, 100, callbackAskCustom, []string{"За неделю", "За месяц"}))
+
+	if called {
+		t.Error("custom-variant press must not invoke the handler")
+	}
+	if f.editCount() != 1 {
+		t.Errorf("keyboard not cleared: %d edits", f.editCount())
+	}
+	sent := f.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "Напишите свой вариант") {
+		t.Fatalf("want free-text nudge, got %+v", sent)
+	}
+}
+
 func TestUnknownUserGetsRefusal(t *testing.T) {
 	f := newFakeAPI(t)
 	b := newTestBot(t, f, Echo())
@@ -274,8 +395,8 @@ func TestDuplicateUpdateProcessedOnce(t *testing.T) {
 
 func TestHandlerErrorRepliesApology(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "", errors.New("boom")
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{}, errors.New("boom")
 	}))
 
 	process(b, update(1, 100, "сломайся"))
@@ -288,8 +409,8 @@ func TestHandlerErrorRepliesApology(t *testing.T) {
 
 func TestEmptyReplySendsNothing(t *testing.T) {
 	f := newFakeAPI(t)
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
-		return "", nil
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
+		return Reply{}, nil
 	}))
 
 	process(b, update(1, 100, "молчи"))
@@ -404,11 +525,11 @@ func TestParseAllowedIDs(t *testing.T) {
 
 func TestEchoPhotoStub(t *testing.T) {
 	msg := &models.Message{Photo: []models.PhotoSize{{FileID: "x"}}}
-	text, err := Echo().Handle(context.Background(), msg)
+	rep, err := Echo().Handle(context.Background(), msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text == "" || text == msg.Text {
-		t.Fatalf("want photo stub reply, got %q", text)
+	if rep.Text == "" || rep.Text == msg.Text {
+		t.Fatalf("want photo stub reply, got %q", rep.Text)
 	}
 }

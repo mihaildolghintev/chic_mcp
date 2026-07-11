@@ -218,29 +218,33 @@ func runBot() {
 	// handler at construction — the closure captures the variable assigned
 	// right below, before any update is served.
 	var bot *telegram.Bot
-	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (string, error) {
+	handler := telegram.HandlerFunc(func(ctx context.Context, msg *models.Message) (telegram.Reply, error) {
 		// /new works the same as the inline button: forget the dialog.
 		if cmd, _, _ := strings.Cut(strings.TrimSpace(msg.Text), "@"); cmd == "/new" {
 			if err := ag.Reset(ctx, msg.Chat.ID); err != nil {
-				return "", fmt.Errorf("reset session: %w", err)
+				return telegram.Reply{}, fmt.Errorf("reset session: %w", err)
 			}
-			return telegram.MsgSessionReset, nil
+			return telegram.Reply{Text: telegram.MsgSessionReset}, nil
 		}
 		text, imageURI := msg.Text, ""
 		if len(msg.Photo) > 0 {
 			uri, err := bot.PhotoDataURI(ctx, msg)
 			if errors.Is(err, telegram.ErrPhotoTooLarge) {
-				return "Фото слишком большое, лимит 20 МБ.", nil
+				return telegram.Reply{Text: "Фото слишком большое, лимит 20 МБ."}, nil
 			}
 			if err != nil {
-				return "", fmt.Errorf("photo download: %w", err)
+				return telegram.Reply{}, fmt.Errorf("photo download: %w", err)
 			}
 			text, imageURI = msg.Caption, uri
 		}
 		if text == "" && imageURI == "" {
-			return "Я понимаю текст и фотографии.", nil
+			return telegram.Reply{Text: "Я понимаю текст и фотографии."}, nil
 		}
-		return ag.Handle(ctx, msg.Chat.ID, text, imageURI)
+		res, err := ag.Handle(ctx, msg.Chat.ID, text, imageURI)
+		if err != nil {
+			return telegram.Reply{}, err
+		}
+		return telegram.Reply{Text: res.Text, Options: res.Options, AllowCustom: res.AllowCustom}, nil
 	})
 
 	// telegram.New calls getMe under the hood — a bad token fails fast here,

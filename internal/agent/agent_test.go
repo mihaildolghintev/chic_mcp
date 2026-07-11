@@ -149,12 +149,12 @@ func TestHandle_EndToEnd(t *testing.T) {
 	}}
 	a, st := newTestAgent(t, script, api, Options{})
 
-	answer, err := a.Handle(context.Background(), 7, "что есть из футболок?", "")
+	res, err := a.Handle(context.Background(), 7, "что есть из футболок?", "")
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if answer != "Нашёл 1 товар: Футболка, 990 ₽." {
-		t.Errorf("answer = %q", answer)
+	if res.Text != "Нашёл 1 товар: Футболка, 990 ₽." {
+		t.Errorf("answer = %q", res.Text)
 	}
 
 	// The tool really executed against the fake MoySklad.
@@ -216,6 +216,65 @@ func TestHandle_HistoryReplayed(t *testing.T) {
 	}
 }
 
+// TestHandle_AskUser: an ambiguous question makes the model call ask_user;
+// Handle must return the question with its options (not run it as a tool) and
+// persist the question so the resuming turn sees it.
+func TestHandle_AskUser(t *testing.T) {
+	api := &fakeAPI{}
+	script := &scriptedLLM{responses: []string{
+		toolCall("ask_user", `{"question":"За какой период?","options":["За неделю","За месяц"],"allow_custom":true}`, 20),
+		final("Продажи за месяц: 100 шт.", 30),
+	}}
+	a, st := newTestAgent(t, script, api, Options{})
+
+	ctx := context.Background()
+	res, err := a.Handle(ctx, 7, "покажи продажи", "")
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if res.Text != "За какой период?" {
+		t.Errorf("question = %q", res.Text)
+	}
+	if len(res.Options) != 2 || res.Options[0] != "За неделю" || res.Options[1] != "За месяц" {
+		t.Errorf("options = %v", res.Options)
+	}
+	if !res.AllowCustom {
+		t.Error("AllowCustom = false, want true")
+	}
+	// Exactly one LLM round: ask_user is terminal, it never went back for more.
+	if len(script.requests) != 1 {
+		t.Errorf("ask_user was not terminal: %d LLM calls", len(script.requests))
+	}
+
+	// The question is stored as the assistant turn so the resume sees it.
+	hist, err := st.RecentMessages(ctx, 7, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 || hist[1].Role != "assistant" || hist[1].Content != "За какой период?" {
+		t.Fatalf("history = %+v, want user + assistant question", hist)
+	}
+
+	// Resume: the chosen option comes in as the next message and the loop
+	// continues from history to a final answer.
+	res, err = a.Handle(ctx, 7, "За месяц", "")
+	if err != nil {
+		t.Fatalf("resume Handle: %v", err)
+	}
+	if len(res.Options) != 0 {
+		t.Errorf("resume still a question: %v", res.Options)
+	}
+	if res.Text != "Продажи за месяц: 100 шт." {
+		t.Errorf("resume answer = %q", res.Text)
+	}
+	// The resume request replayed the question and carried the choice.
+	msgs := script.requests[1]["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" || last["content"] != "За месяц" {
+		t.Errorf("resume last message = %v, want the chosen option", last)
+	}
+}
+
 func TestHandle_RateLimited(t *testing.T) {
 	script := &scriptedLLM{responses: []string{final("ок", 10)}}
 	a, _ := newTestAgent(t, script, &fakeAPI{}, Options{RatePerHour: 1})
@@ -224,12 +283,12 @@ func TestHandle_RateLimited(t *testing.T) {
 	if _, err := a.Handle(ctx, 7, "первый", ""); err != nil {
 		t.Fatal(err)
 	}
-	answer, err := a.Handle(ctx, 7, "второй", "")
+	res, err := a.Handle(ctx, 7, "второй", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answer != msgRateLimited {
-		t.Errorf("answer = %q, want rate-limit message", answer)
+	if res.Text != msgRateLimited {
+		t.Errorf("answer = %q, want rate-limit message", res.Text)
 	}
 	if len(script.requests) != 1 {
 		t.Errorf("rate-limited request still reached the LLM (%d calls)", len(script.requests))
@@ -244,12 +303,12 @@ func TestHandle_TokenStopLoss(t *testing.T) {
 	}}
 	a, _ := newTestAgent(t, script, &fakeAPI{}, Options{MaxTokens: 1000})
 
-	answer, err := a.Handle(context.Background(), 7, "дорогой вопрос", "")
+	res, err := a.Handle(context.Background(), 7, "дорогой вопрос", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answer != msgBudgetSpent {
-		t.Errorf("answer = %q, want token stop-loss message", answer)
+	if res.Text != msgBudgetSpent {
+		t.Errorf("answer = %q, want token stop-loss message", res.Text)
 	}
 	if len(script.requests) != 1 {
 		t.Errorf("stop-loss did not stop the loop: %d LLM calls", len(script.requests))
@@ -262,12 +321,12 @@ func TestHandle_RoundLimit(t *testing.T) {
 	script := &scriptedLLM{responses: []string{loop, loop}}
 	a, _ := newTestAgent(t, script, &fakeAPI{}, Options{MaxRounds: 2})
 
-	answer, err := a.Handle(context.Background(), 7, "зациклись", "")
+	res, err := a.Handle(context.Background(), 7, "зациклись", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answer != msgTooManyloops {
-		t.Errorf("answer = %q, want round-limit message", answer)
+	if res.Text != msgTooManyloops {
+		t.Errorf("answer = %q, want round-limit message", res.Text)
 	}
 }
 
@@ -275,12 +334,12 @@ func TestHandle_PhotoWithoutVision(t *testing.T) {
 	script := &scriptedLLM{}
 	a, _ := newTestAgent(t, script, &fakeAPI{}, Options{})
 
-	answer, err := a.Handle(context.Background(), 7, "что на фото?", "data:image/jpeg;base64,AAAA")
+	res, err := a.Handle(context.Background(), 7, "что на фото?", "data:image/jpeg;base64,AAAA")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if answer != msgNoVision {
-		t.Errorf("answer = %q, want no-vision message", answer)
+	if res.Text != msgNoVision {
+		t.Errorf("answer = %q, want no-vision message", res.Text)
 	}
 	if len(script.requests) != 0 {
 		t.Error("photo request reached a text-only LLM")
