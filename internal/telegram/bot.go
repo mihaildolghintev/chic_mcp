@@ -47,22 +47,10 @@ func Echo() Handler {
 	})
 }
 
-// The "new session" affordance: a /new command in the bot menu and an inline
-// button under every answer, both resetting the agent's dialog memory so the
-// next question starts from a clean slate.
-const (
-	callbackNewSession = "new_session"
-	// MsgSessionReset confirms a session reset; exported so the /new command
-	// handler in main answers with the same wording as the button.
-	MsgSessionReset = "🆕 Начали заново — прошлый диалог больше не учитывается."
-	msgResetFailed  = "Не получилось сбросить контекст, попробуйте ещё раз."
-)
-
-var newSessionKeyboard = &models.InlineKeyboardMarkup{
-	InlineKeyboard: [][]models.InlineKeyboardButton{
-		{{Text: "🆕 Новый диалог", CallbackData: callbackNewSession}},
-	},
-}
+// MsgSessionReset confirms a session reset; exported so the /new command handler
+// in main answers with fixed wording. The reset itself is reached via the /new
+// command and the /menu affordances, not a per-answer button.
+const MsgSessionReset = "🆕 Начали заново — прошлый диалог больше не учитывается."
 
 // Bot is the go-telegram/bot instance plus chic's policy layer. It answers
 // rejected users with a fixed refusal so the bot doesn't look dead to a
@@ -72,7 +60,7 @@ type Bot struct {
 	secret         string
 	allowed        map[int64]struct{}
 	handler        Handler
-	onNewSession   func(ctx context.Context, userID int64) error
+	onFeedback     FeedbackFunc
 	onMemoryList   func(ctx context.Context, userID int64) ([]MemoryItem, error)
 	onMemoryForget func(ctx context.Context, userID int64, key string) error
 	seen           *dedupe
@@ -120,10 +108,11 @@ func New(token, webhookSecret string, allowed map[int64]struct{}, handler Handle
 // wrap (SendPhoto, SendDocument, inline keyboards, ...).
 func (b *Bot) API() *bot.Bot { return b.api }
 
-// OnNewSession installs the reset hook the "new dialog" button and /new
-// command trigger. The hook resets one user's dialog memory. Must be called
-// before StartWebhook.
-func (b *Bot) OnNewSession(f func(ctx context.Context, userID int64) error) { b.onNewSession = f }
+// OnFeedback installs the hook a 👍/👎 press calls to record a rating against
+// the answer's trace span (in practice a Phoenix annotation). Without it the
+// buttons still render but a press is silently inert. Must be called before
+// StartWebhook.
+func (b *Bot) OnFeedback(f FeedbackFunc) { b.onFeedback = f }
 
 // OnMemory installs the read/delete hooks the /memory command uses: list a
 // user's durable preferences and forget one by key. Both must be set for the
@@ -193,7 +182,7 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 
 	if _, ok := b.allowed[msg.From.ID]; !ok {
 		log.Warn("message from user not in allowlist")
-		b.reply(ctx, log, msg.Chat.ID, "Извините, этот бот приватный.", false)
+		b.reply(ctx, log, msg.Chat.ID, "Извините, этот бот приватный.", "")
 		return
 	}
 
@@ -228,14 +217,16 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	if err != nil {
 		span.RecordError(err)
 		log.Error("handler failed", "err", err)
-		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", false)
+		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", "")
 		return
 	}
 	span.SetAttributes(tracing.Output(text))
 	if text == "" {
 		return
 	}
-	b.reply(ctx, log, msg.Chat.ID, text, true)
+	// The root span id rides into the 👍/👎 buttons so a later press annotates
+	// this exact trace; empty (tracing disabled) means no buttons.
+	b.reply(ctx, log, msg.Chat.ID, text, tracing.SpanID(span))
 }
 
 // messageQuestion is the user's text for a trace's root span: the message text,
@@ -295,7 +286,7 @@ func (b *Bot) showMemory(ctx context.Context, log *slog.Logger, userID, chatID i
 	items, err := b.onMemoryList(ctx, userID)
 	if err != nil {
 		log.Error("memory list failed", "err", err)
-		b.reply(ctx, log, chatID, "Не удалось прочитать память, попробуйте позже.", false)
+		b.reply(ctx, log, chatID, "Не удалось прочитать память, попробуйте позже.", "")
 		return
 	}
 	text, markup := renderMemory(items)
@@ -352,30 +343,44 @@ func (b *Bot) sendRaw(ctx context.Context, log *slog.Logger, chatID int64, htmlT
 }
 
 // onCallback handles an inline-button press and routes it by callback data:
-// the "new dialog" reset, a quick-reply question, or a memory-delete button.
+// a 👍/👎 rating, a quick-reply question, or a memory-delete button.
 func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	log := b.logger.With("callback_id", q.ID, "user_id", q.From.ID)
-	// Ack up front, not on return: a quick-reply press runs the agent for
-	// seconds to minutes, and Telegram rejects an answerCallbackQuery that
-	// arrives after its ~15s window — leaving the button spinner stuck. Acking
-	// first clears the spinner immediately and covers every path below.
-	if _, err := b.api.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}); err != nil {
-		log.Debug("answerCallbackQuery failed", "err", err)
+	allowed := false
+	if _, ok := b.allowed[q.From.ID]; ok {
+		allowed = true
+	}
+	isFeedback := strings.HasPrefix(q.Data, feedbackPrefix)
+
+	// Ack to clear the button spinner. A feedback tap gets a "thanks" toast (its
+	// work is a quick annotation write); the slower paths — a quick-reply runs
+	// the agent for seconds to minutes — get a plain ack up front, since Telegram
+	// rejects an answerCallbackQuery arriving after its ~15s window.
+	if isFeedback && allowed {
+		b.answerCallback(ctx, log, q, msgFeedbackThanks)
+	} else {
+		b.answerCallback(ctx, log, q, "")
 	}
 
-	if _, ok := b.allowed[q.From.ID]; !ok {
+	if !allowed {
 		log.Warn("callback from user not in allowlist")
 		return
 	}
-	// Message can be inaccessible when the button is older than 48h — then
-	// there is no chat to answer in, so drop the press.
-	if q.Message.Message == nil {
+
+	// Feedback carries its span id in the callback data and records even when the
+	// message is too old to be accessible (the audit workflow rates old dialogs),
+	// so it runs before the accessible-message guard the other handlers need.
+	if isFeedback {
+		b.doFeedback(ctx, log, q)
 		return
 	}
 
+	// Message is inaccessible when the button is older than 48h — the remaining
+	// handlers have no chat to answer in, so drop the press.
+	if q.Message.Message == nil {
+		return
+	}
 	switch {
-	case q.Data == callbackNewSession:
-		b.doNewSession(ctx, log, q)
 	case strings.HasPrefix(q.Data, quickReplyPrefix):
 		b.doQuickReply(ctx, log, q)
 	case strings.HasPrefix(q.Data, memForgetPrefix):
@@ -383,20 +388,16 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 	}
 }
 
-// doNewSession resets the agent's dialog memory for the chat behind q.
-func (b *Bot) doNewSession(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
-	if b.onNewSession == nil {
-		return
+// answerCallback acks a callback query, optionally with a toast. Failure is
+// non-fatal (a stale query just leaves the spinner to time out).
+func (b *Bot) answerCallback(ctx context.Context, log *slog.Logger, q *models.CallbackQuery, toast string) {
+	p := &bot.AnswerCallbackQueryParams{CallbackQueryID: q.ID}
+	if toast != "" {
+		p.Text = toast
 	}
-	chatID := q.Message.Message.Chat.ID
-	userID := q.From.ID
-	if err := b.onNewSession(ctx, userID); err != nil {
-		log.Error("new session reset failed", "err", err)
-		b.reply(ctx, log, chatID, msgResetFailed, false)
-		return
+	if _, err := b.api.AnswerCallbackQuery(ctx, p); err != nil {
+		log.Debug("answerCallbackQuery failed", "err", err)
 	}
-	log.Info("new session started", "user_id", userID)
-	b.reply(ctx, log, chatID, MsgSessionReset, false)
 }
 
 // doQuickReply runs the tapped template question through the agent exactly as
@@ -408,7 +409,7 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 		return
 	}
 	chatID := q.Message.Message.Chat.ID
-	b.reply(ctx, log, chatID, "❓ "+question, false)
+	b.reply(ctx, log, chatID, "❓ "+question, "")
 
 	ctx, span := tracing.Tracer().Start(ctx, "telegram.quick_reply")
 	defer span.End()
@@ -426,14 +427,14 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 	if err != nil {
 		span.RecordError(err)
 		log.Error("quick-reply handler failed", "err", err)
-		b.reply(ctx, log, chatID, "Что-то пошло не так, попробуйте ещё раз.", false)
+		b.reply(ctx, log, chatID, "Что-то пошло не так, попробуйте ещё раз.", "")
 		return
 	}
 	span.SetAttributes(tracing.Output(text))
 	if text == "" {
 		return
 	}
-	b.reply(ctx, log, chatID, text, true)
+	b.reply(ctx, log, chatID, text, tracing.SpanID(span))
 }
 
 // doMemoryForget deletes the preference behind a delete button, then re-renders
@@ -477,14 +478,17 @@ const maxMessageLen = 4096
 // renderer is what guarantees it parses); the result is split into limit-sized
 // chunks with tags balanced per chunk, and if Telegram still rejects a chunk
 // with 400 it is resent as plain text — a degraded answer beats a swallowed
-// one. withKeyboard hangs the "new dialog" button under the last chunk —
-// answers get it, service notices don't.
-func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text string, withKeyboard bool) {
+// one. A non-empty spanID hangs the 👍/👎 feedback buttons under the last chunk
+// (encoding that span for a later rating) — answers get them, service notices
+// pass "" and don't.
+func (b *Bot) reply(ctx context.Context, log *slog.Logger, chatID int64, text, spanID string) {
 	chunks := splitHTML(renderTelegramHTML(text), maxMessageLen)
 	for i, chunk := range chunks {
 		var markup models.ReplyMarkup
-		if withKeyboard && i == len(chunks)-1 {
-			markup = newSessionKeyboard
+		if i == len(chunks)-1 {
+			if kb := feedbackKeyboard(spanID); kb != nil {
+				markup = kb
+			}
 		}
 		_, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID:      chatID,

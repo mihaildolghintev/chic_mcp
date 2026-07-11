@@ -48,6 +48,7 @@ func TestStartCommandShowsMenu(t *testing.T) {
 // TestQuickReplyRunsQuestion: tapping a template button echoes the question and
 // runs it through the agent handler, then answers with the new-session button.
 func TestQuickReplyRunsQuestion(t *testing.T) {
+	enableTestTracer(t)
 	f := newFakeAPI(t)
 	var gotText string
 	b := newTestBot(t, f, HandlerFunc(func(_ context.Context, msg *models.Message) (string, error) {
@@ -70,8 +71,8 @@ func TestQuickReplyRunsQuestion(t *testing.T) {
 	if sent[0].ReplyMarkup != "" {
 		t.Errorf("question echo must not carry a keyboard, got %q", sent[0].ReplyMarkup)
 	}
-	if sent[1].Text != "ответ агента" || !strings.Contains(sent[1].ReplyMarkup, callbackNewSession) {
-		t.Errorf("answer must carry the new-session button, got %+v", sent[1])
+	if sent[1].Text != "ответ агента" || !strings.Contains(sent[1].ReplyMarkup, feedbackLike) {
+		t.Errorf("answer must carry the 👍/👎 buttons, got %+v", sent[1])
 	}
 }
 
