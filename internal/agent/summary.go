@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 
@@ -25,6 +26,11 @@ const (
 	// summaryMaxChars caps the summary we accept back, a backstop against a
 	// model that ignores the "коротко" instruction and re-bloats the prompt.
 	summaryMaxChars = 1200
+	// maxUnsummarizedScan bounds the tail pulled per request when folding, so a
+	// pathological session can't load unbounded rows. Far above any real
+	// session; when a session somehow exceeds it, folding just catches up over
+	// the next few requests instead of reading everything at once.
+	maxUnsummarizedScan = 400
 )
 
 // summarySystemPrompt steers the condense call. It asks for a dense,
@@ -36,43 +42,75 @@ const summarySystemPrompt = `Ты сжимаешь историю диалога
 незакрытые уточнения. Не выдумывай ничего сверх текста. Без вступлений и без «вот сводка» —
 сразу содержание. Язык — тот же, что в диалоге.`
 
-// condenseHistory bounds the replayed history to roughly opts.SummaryCharBudget.
-// Under budget it returns the history untouched and an empty summary. Over
-// budget it summarizes everything but the last summaryKeepRecentTurns turns and
-// returns (summary, recentTurns). It is best-effort: if the summarization call
-// fails, it degrades to dropping the older turns (window still bounded) rather
-// than failing the user's request — logged, never fatal.
-func (a *Agent) condenseHistory(ctx context.Context, log *slog.Logger, history []store.Message) (summary string, recent []store.Message) {
-	if a.opts.SummaryCharBudget < 0 { // summarization disabled
-		return "", history
-	}
-	total := 0
-	for _, m := range history {
-		total += len(m.Content)
-	}
-	if total <= a.opts.SummaryCharBudget || len(history) <= summaryKeepRecentTurns {
-		return "", history
-	}
-
-	older := history[:len(history)-summaryKeepRecentTurns]
-	recent = history[len(history)-summaryKeepRecentTurns:]
-
-	summary = a.summarize(ctx, older)
-	if summary == "" {
-		// Couldn't summarize — keep the window bounded by dropping the old turns
-		// outright. A shorter memory beats an overflowing prompt or an error.
-		log.Warn("history summarization failed, dropping oldest turns", "dropped", len(older))
+// condenseHistory returns the context to replay for userID's current session
+// (epoch): a rolling summary of the older turns plus the recent turns verbatim.
+// The summary is persisted and folded incrementally — each request only
+// summarizes the turns that have scrolled past the budget since last time,
+// instead of re-summarizing the whole history. Best-effort throughout: any
+// store or LLM failure degrades to a bounded window, never an error.
+func (a *Agent) condenseHistory(ctx context.Context, log *slog.Logger, userID, epoch int64) (summary string, recent []store.Message) {
+	if a.opts.SummaryCharBudget < 0 { // summarization disabled — plain last-N window
+		recent, err := a.store.RecentMessages(ctx, userID, a.opts.HistoryDepth)
+		if err != nil {
+			log.Warn("history read failed, answering without it", "err", err)
+		}
 		return "", recent
 	}
-	log.Info("history condensed", "summarized_turns", len(older), "kept_turns", len(recent), "summary_chars", len(summary))
-	return summary, recent
+
+	// Load the running summary and read only the turns not yet folded into it.
+	summary, upToID, err := a.store.GetSessionSummary(ctx, userID, epoch)
+	if err != nil {
+		log.Warn("session summary read failed", "err", err)
+	}
+	if upToID < epoch {
+		// Nothing folded yet (or a stale/absent watermark): this session's turns
+		// are exactly those after its boundary.
+		upToID = epoch
+	}
+	tail, err := a.store.MessagesSince(ctx, userID, upToID, maxUnsummarizedScan)
+	if err != nil {
+		log.Warn("session tail read failed, replaying summary only", "err", err)
+		return summary, nil
+	}
+
+	// Under budget, or too few turns to bother: keep the whole tail verbatim.
+	// Budget is counted in runes (not bytes), so the number means characters —
+	// a Cyrillic letter counts as one, matching how a reader would size a dialog.
+	total := 0
+	for _, m := range tail {
+		total += utf8.RuneCountInString(m.Content)
+	}
+	if total <= a.opts.SummaryCharBudget || len(tail) <= summaryKeepRecentTurns {
+		return summary, tail
+	}
+
+	// Fold everything but the recent tail into the running summary.
+	foldable := tail[:len(tail)-summaryKeepRecentTurns]
+	recent = tail[len(tail)-summaryKeepRecentTurns:]
+
+	next := a.summarizeInto(ctx, summary, foldable)
+	if next == "" {
+		// Couldn't summarize — keep the window bounded by dropping the foldable
+		// turns this round. A shorter memory beats an overflowing prompt or an
+		// error; the existing summary (if any) still stands.
+		log.Warn("history summarization failed, dropping older turns", "dropped", len(foldable))
+		return summary, recent
+	}
+	// Persist so the next request reuses this instead of re-summarizing.
+	if err := a.store.PutSessionSummary(ctx, userID, epoch, next, foldable[len(foldable)-1].ID); err != nil {
+		log.Warn("persist session summary failed", "err", err)
+	}
+	log.Info("history condensed", "folded_turns", len(foldable), "kept_turns", len(recent), "summary_chars", len(next))
+	return next, recent
 }
 
-// summarize asks the (cheap, text) provider to compress a run of turns into a
-// short recap. Returns "" on any failure so the caller can degrade gracefully.
-func (a *Agent) summarize(ctx context.Context, msgs []store.Message) string {
+// summarizeInto asks the (cheap, text) provider to fold a run of turns into the
+// running summary — prev is the summary so far (empty on the first fold), msgs
+// are the new turns to absorb. Returns "" on any failure so the caller degrades
+// gracefully.
+func (a *Agent) summarizeInto(ctx context.Context, prev string, msgs []store.Message) string {
 	if len(msgs) == 0 {
-		return ""
+		return prev
 	}
 	// A named span so the history-condense LLM call is distinguishable in Phoenix
 	// from the main answer's completions instead of being an anonymous llm.* span.
@@ -81,9 +119,15 @@ func (a *Agent) summarize(ctx context.Context, msgs []store.Message) string {
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindChain),
 		attribute.Int("summarized_turns", len(msgs)),
+		attribute.Bool("incremental", prev != ""),
 	)
 
 	var b strings.Builder
+	if prev != "" {
+		b.WriteString("Предыдущее краткое содержание:\n")
+		b.WriteString(prev)
+		b.WriteString("\n\nНовые сообщения диалога:\n")
+	}
 	for _, m := range msgs {
 		who := "Пользователь"
 		if m.Role == "assistant" {

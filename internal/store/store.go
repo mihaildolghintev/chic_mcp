@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"time"
@@ -36,7 +37,10 @@ import (
 var migrationsFS embed.FS
 
 // Message is one turn of a chat dialog, as the agent replays it to the LLM.
+// ID is the row id; it is populated by reads that need a watermark (the rolling
+// summary tracks how far it has folded) and left zero where callers don't care.
 type Message struct {
+	ID      int64
 	Role    string // "user" or "assistant"
 	Content string
 }
@@ -54,6 +58,11 @@ type Store interface {
 	AppendMessage(ctx context.Context, userID int64, role, content string) error
 	RecentMessages(ctx context.Context, userID int64, n int) ([]Message, error)
 	StartSession(ctx context.Context, userID int64) error
+	SessionEpoch(ctx context.Context, userID int64) (int64, error)
+	MessagesSince(ctx context.Context, userID, sinceID int64, limit int) ([]Message, error)
+
+	GetSessionSummary(ctx context.Context, userID, epoch int64) (summary string, upToID int64, err error)
+	PutSessionSummary(ctx context.Context, userID, epoch int64, summary string, upToID int64) error
 
 	SetPreference(ctx context.Context, userID int64, key, value string) error
 	DeletePreference(ctx context.Context, userID int64, key string) error
@@ -165,6 +174,22 @@ func (d *DB) StartSession(ctx context.Context, userID int64) error {
 	return nil
 }
 
+// SessionEpoch identifies the user's current dialog session by the id of the
+// last /new boundary (0 before the first reset). It changes exactly when
+// StartSession draws a new boundary and is stable in between, so callers can
+// build a session key that rolls over on /new — e.g. the Phoenix session.id.
+func (d *DB) SessionEpoch(ctx context.Context, userID int64) (int64, error) {
+	var epoch int64
+	err := d.read.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM messages WHERE user_id = ? AND role = 'reset'`,
+		userID,
+	).Scan(&epoch)
+	if err != nil {
+		return 0, fmt.Errorf("store: session epoch: %w", err)
+	}
+	return epoch, nil
+}
+
 // RecentMessages returns the last n messages of the current session for
 // userID in chronological order — ready to be prepended to an LLM
 // conversation. Messages before the last session boundary (and the boundary
@@ -174,7 +199,7 @@ func (d *DB) RecentMessages(ctx context.Context, userID int64, n int) ([]Message
 		return nil, nil
 	}
 	rows, err := d.read.QueryContext(ctx,
-		`SELECT role, content FROM (
+		`SELECT id, role, content FROM (
 			SELECT id, role, content FROM messages
 			WHERE user_id = ?
 			  AND id > COALESCE((SELECT MAX(id) FROM messages WHERE user_id = ? AND role = 'reset'), 0)
@@ -186,11 +211,36 @@ func (d *DB) RecentMessages(ctx context.Context, userID int64, n int) ([]Message
 		return nil, fmt.Errorf("store: recent messages: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	return scanMessages(rows)
+}
 
+// MessagesSince returns up to limit dialog turns (user/assistant only, boundary
+// rows excluded) for userID with id > sinceID, in chronological order. It backs
+// the rolling summary: sinceID is the summary's watermark, so the caller sees
+// only the turns not yet folded. limit bounds a pathological first fold.
+func (d *DB) MessagesSince(ctx context.Context, userID, sinceID int64, limit int) ([]Message, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := d.read.QueryContext(ctx,
+		`SELECT id, role, content FROM messages
+		 WHERE user_id = ? AND id > ? AND role IN ('user', 'assistant')
+		 ORDER BY id ASC LIMIT ?`,
+		userID, sinceID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: messages since: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanMessages(rows)
+}
+
+// scanMessages drains an (id, role, content) result set into Messages.
+func scanMessages(rows *sql.Rows) ([]Message, error) {
 	var out []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.Role, &m.Content); err != nil {
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content); err != nil {
 			return nil, fmt.Errorf("store: scan message: %w", err)
 		}
 		out = append(out, m)
@@ -199,6 +249,46 @@ func (d *DB) RecentMessages(ctx context.Context, userID int64, n int) ([]Message
 		return nil, fmt.Errorf("store: iterate messages: %w", err)
 	}
 	return out, nil
+}
+
+// GetSessionSummary returns the persisted rolling summary for (userID, epoch)
+// and the id of the last message folded into it. A missing row yields
+// ("", 0, nil) — the caller treats that as "nothing summarized yet".
+func (d *DB) GetSessionSummary(ctx context.Context, userID, epoch int64) (string, int64, error) {
+	var (
+		summary string
+		upToID  int64
+	)
+	err := d.read.QueryRowContext(ctx,
+		`SELECT summary, up_to_id FROM session_summary WHERE user_id = ? AND epoch = ?`,
+		userID, epoch,
+	).Scan(&summary, &upToID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("store: get session summary: %w", err)
+	}
+	return summary, upToID, nil
+}
+
+// PutSessionSummary upserts the rolling summary for (userID, epoch), advancing
+// its watermark to upToID. The next request reads this back instead of
+// re-summarizing the folded turns.
+func (d *DB) PutSessionSummary(ctx context.Context, userID, epoch int64, summary string, upToID int64) error {
+	_, err := d.write.ExecContext(ctx,
+		`INSERT INTO session_summary (user_id, epoch, summary, up_to_id, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(user_id, epoch) DO UPDATE SET
+		   summary = excluded.summary,
+		   up_to_id = excluded.up_to_id,
+		   updated_at = excluded.updated_at`,
+		userID, epoch, summary, upToID, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("store: put session summary: %w", err)
+	}
+	return nil
 }
 
 // SetPreference stores (or overwrites) a durable preference for userID. Keys

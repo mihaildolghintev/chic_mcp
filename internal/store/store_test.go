@@ -107,6 +107,58 @@ func TestStartSessionHidesOlderMessages(t *testing.T) {
 	}
 }
 
+func TestSessionEpochRollsOverOnReset(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	// No reset yet: epoch is the zero value, shared by every fresh chat.
+	first, err := d.SessionEpoch(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0 {
+		t.Errorf("epoch before any reset = %d, want 0", first)
+	}
+
+	if err := d.AppendMessage(ctx, 42, "user", "вопрос"); err != nil {
+		t.Fatal(err)
+	}
+	// Appending messages must not move the epoch — only /new does.
+	if same, err := d.SessionEpoch(ctx, 42); err != nil {
+		t.Fatal(err)
+	} else if same != first {
+		t.Errorf("epoch changed on append: %d -> %d", first, same)
+	}
+
+	if err := d.StartSession(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	after, err := d.SessionEpoch(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == first {
+		t.Errorf("epoch did not change after reset, still %d", after)
+	}
+
+	// A second reset rolls it over again.
+	if err := d.StartSession(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := d.SessionEpoch(ctx, 42); err != nil {
+		t.Fatal(err)
+	} else if again == after {
+		t.Errorf("epoch did not change after second reset, still %d", again)
+	}
+
+	// The epoch is per user: chat 7 never reset, so it stays at zero.
+	if other, err := d.SessionEpoch(ctx, 7); err != nil {
+		t.Fatal(err)
+	} else if other != 0 {
+		t.Errorf("chat 7 epoch = %d, want 0 (its own boundary)", other)
+	}
+}
+
 func TestChatsAreIsolated(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
@@ -124,6 +176,87 @@ func TestChatsAreIsolated(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Content != "for chat 1" {
 		t.Errorf("chat 1 sees %+v, want only its own message", got)
+	}
+}
+
+func TestMessagesSinceSkipsBoundariesAndWatermark(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.AppendMessage(ctx, 42, "user", "старое"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StartSession(ctx, 42); err != nil { // inserts a 'reset' row
+		t.Fatal(err)
+	}
+	if err := d.AppendMessage(ctx, 42, "user", "новое-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AppendMessage(ctx, 42, "assistant", "новое-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Since the very start: reset rows are never returned, only dialog turns.
+	all, err := d.MessagesSince(ctx, 42, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("MessagesSince from 0 = %+v, want 3 dialog turns (no reset)", all)
+	}
+	for _, m := range all {
+		if m.Role == "reset" || m.ID == 0 {
+			t.Errorf("unexpected row %+v (reset leaked or missing id)", m)
+		}
+	}
+
+	// The watermark excludes everything at or before it.
+	watermark := all[0].ID
+	rest, err := d.MessagesSince(ctx, 42, watermark, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 2 || rest[0].Content != "новое-1" {
+		t.Errorf("MessagesSince after watermark = %+v, want the two newer turns", rest)
+	}
+
+	// limit caps the result.
+	if capped, err := d.MessagesSince(ctx, 42, 0, 1); err != nil || len(capped) != 1 {
+		t.Fatalf("MessagesSince limit=1 = %+v, %v; want 1", capped, err)
+	}
+}
+
+func TestSessionSummaryRoundTrip(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	// Missing row is not an error: empty summary, zero watermark.
+	if s, up, err := d.GetSessionSummary(ctx, 42, 0); err != nil || s != "" || up != 0 {
+		t.Fatalf("missing summary = %q, %d, %v; want empty", s, up, err)
+	}
+
+	if err := d.PutSessionSummary(ctx, 42, 5, "сводка A", 12); err != nil {
+		t.Fatal(err)
+	}
+	s, up, err := d.GetSessionSummary(ctx, 42, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "сводка A" || up != 12 {
+		t.Errorf("round-trip = %q, %d; want \"сводка A\", 12", s, up)
+	}
+
+	// Upsert on the same (user, epoch) key advances the watermark, not duplicates.
+	if err := d.PutSessionSummary(ctx, 42, 5, "сводка B", 20); err != nil {
+		t.Fatal(err)
+	}
+	if s, up, _ := d.GetSessionSummary(ctx, 42, 5); s != "сводка B" || up != 20 {
+		t.Errorf("after upsert = %q, %d; want \"сводка B\", 20", s, up)
+	}
+
+	// A different epoch is a separate row — old summary untouched.
+	if s, _, _ := d.GetSessionSummary(ctx, 42, 6); s != "" {
+		t.Errorf("epoch 6 = %q, want empty (own row)", s)
 	}
 }
 
