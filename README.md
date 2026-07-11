@@ -94,10 +94,23 @@ All knobs are documented in [.env.example](.env.example).
 Off by default — the project runs fully without it. Set
 `PHOENIX_COLLECTOR_ENDPOINT` to an [Arize Phoenix](https://arize.com/phoenix/)
 collector (OTLP/HTTP) and the bot emits OpenTelemetry traces with OpenInference
-semantics: an `AGENT` span per message, nested `LLM` spans (model, provider,
-token counts) and `TOOL` spans (arguments, result). Leave the variable unset and
-no tracer is installed — spans become no-ops, nothing is exported, and there is
-no runtime cost. See the tracing block in [.env.example](.env.example).
+semantics. Each Telegram message is one trace, grouped per user into a Phoenix
+**Session**:
+
+- `telegram.message` → `agent.handle` (`AGENT`) → the round loop.
+- `LLM` spans carry the **full prompt** as per-message cards (system, history,
+  user, tool results), the tools offered, invocation parameters, the model's
+  tool calls, provider routing (DeepSeek vs OpenAI) and token counts — so a
+  prompt is inspectable and diffable, not an opaque blob.
+- `TOOL` spans carry arguments and results; named `history.summarize` /
+  `memory.consolidate` spans mark the internal LLM passes.
+- Outbound HTTP to the LLM providers and MoySklad are child spans, separating
+  upstream latency from our own.
+
+Every trace is stamped with the build version/commit, so a prompt change can be
+compared before/after a deploy. Leave `PHOENIX_COLLECTOR_ENDPOINT` unset and no
+tracer is installed — spans become no-ops, nothing is exported, zero runtime
+cost. See the tracing block in [.env.example](.env.example).
 
 ## Run locally (macOS, Apple Silicon)
 

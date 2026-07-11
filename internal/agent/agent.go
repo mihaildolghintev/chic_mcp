@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -180,6 +181,8 @@ func (a *Agent) Handle(ctx context.Context, userID int64, text, imageDataURI str
 	defer span.End()
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindAgent),
+		// session.id groups a user's whole conversation into one Phoenix Session.
+		tracing.SessionID(strconv.FormatInt(userID, 10)),
 		attribute.Int64("user_id", userID),
 		attribute.Bool("has_image", imageDataURI != ""),
 		tracing.Input(text),

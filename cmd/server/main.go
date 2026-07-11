@@ -183,8 +183,15 @@ func runBot() {
 
 	// Tracing is opt-in (PHOENIX_COLLECTOR_ENDPOINT); disabled it's a no-op. The
 	// shutdown flushes the batch processor, so it must run on exit or the last
-	// spans of the final request are dropped.
-	shutdownTracing, err := tracing.Init(ctx)
+	// spans of the final request are dropped. Build metadata is stamped onto the
+	// resource so every trace pins to the exact version/commit that produced it.
+	bi := buildinfo.Get()
+	shutdownTracing, err := tracing.Init(ctx, tracing.Options{
+		ServiceName:    "chic-bot",
+		ServiceVersion: bi.Version,
+		Revision:       bi.Revision,
+		Environment:    os.Getenv("APP_ENV"),
+	})
 	if err != nil {
 		slog.Error("tracing init", "err", err)
 		os.Exit(1)

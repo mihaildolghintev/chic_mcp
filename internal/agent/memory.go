@@ -8,8 +8,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"mcp.chic.md/internal/llm"
 	"mcp.chic.md/internal/store"
+	"mcp.chic.md/internal/tracing"
 )
 
 // The agent-local memory tools. Unlike the MoySklad tools (served by the
@@ -183,6 +186,15 @@ func (a *Agent) maybeConsolidate(ctx context.Context, userID int64) {
 	if err != nil || len(current) < consolidateThreshold {
 		return
 	}
+
+	// Name the consolidation pass so its LLM call is legible in Phoenix rather
+	// than an anonymous completion nested under the memory tool span.
+	ctx, span := tracing.Tracer().Start(ctx, "memory.consolidate")
+	defer span.End()
+	span.SetAttributes(
+		tracing.SpanKind(tracing.SpanKindChain),
+		attribute.Int("profile_size", len(current)),
+	)
 
 	prompt, err := json.Marshal(consolidatedProfile{Preferences: toEntries(current)})
 	if err != nil {
