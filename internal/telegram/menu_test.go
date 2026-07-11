@@ -51,9 +51,9 @@ func TestQuickReplyRunsQuestion(t *testing.T) {
 	enableTestTracer(t)
 	f := newFakeAPI(t)
 	var gotText string
-	b := newTestBot(t, f, HandlerFunc(func(_ context.Context, msg *models.Message) (string, error) {
+	b := newTestBot(t, f, HandlerFunc(func(_ context.Context, msg *models.Message) (Reply, error) {
 		gotText = msg.Text
-		return "ответ агента", nil
+		return Reply{Text: "ответ агента"}, nil
 	}))
 
 	process(b, callbackUpdate(1, 100, 100, quickReplyPrefix+"0"))
@@ -81,9 +81,9 @@ func TestQuickReplyRunsQuestion(t *testing.T) {
 func TestQuickReplyBadIndexIgnored(t *testing.T) {
 	f := newFakeAPI(t)
 	ran := false
-	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (string, error) {
+	b := newTestBot(t, f, HandlerFunc(func(context.Context, *models.Message) (Reply, error) {
 		ran = true
-		return "x", nil
+		return Reply{Text: "x"}, nil
 	}))
 
 	process(b, callbackUpdate(1, 100, 100, quickReplyPrefix+"999"))

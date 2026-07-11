@@ -21,29 +21,38 @@ import (
 	"mcp.chic.md/internal/tracing"
 )
 
-// Handler processes one allowed message and returns the reply text. The bot
-// owns allowlist checks and reply delivery, so a Handler is pure
-// message-in/text-out — the echo handler today, the LLM agent later.
+// Reply is what a Handler produces: a final answer (Options == nil) or a
+// clarifying question (Options non-empty) the bot renders as an inline
+// keyboard. AllowCustom adds a free-text "свой вариант" button.
+type Reply struct {
+	Text        string
+	Options     []string
+	AllowCustom bool
+}
+
+// Handler processes one allowed message and returns a Reply. The bot owns
+// allowlist checks and delivery, so a Handler is pure message-in/reply-out —
+// the echo handler today, the LLM agent later.
 type Handler interface {
-	Handle(ctx context.Context, msg *models.Message) (string, error)
+	Handle(ctx context.Context, msg *models.Message) (Reply, error)
 }
 
 // HandlerFunc adapts a function to the Handler interface.
-type HandlerFunc func(ctx context.Context, msg *models.Message) (string, error)
+type HandlerFunc func(ctx context.Context, msg *models.Message) (Reply, error)
 
 // Handle implements Handler.
-func (f HandlerFunc) Handle(ctx context.Context, msg *models.Message) (string, error) {
+func (f HandlerFunc) Handle(ctx context.Context, msg *models.Message) (Reply, error) {
 	return f(ctx, msg)
 }
 
 // Echo replies with the incoming text verbatim — the skeleton handler that
 // proves the receive→process→reply loop before any AI is attached.
 func Echo() Handler {
-	return HandlerFunc(func(_ context.Context, msg *models.Message) (string, error) {
+	return HandlerFunc(func(_ context.Context, msg *models.Message) (Reply, error) {
 		if len(msg.Photo) > 0 {
-			return "картинки будут позже", nil
+			return Reply{Text: "картинки будут позже"}, nil
 		}
-		return msg.Text, nil
+		return Reply{Text: msg.Text}, nil
 	})
 }
 
@@ -212,7 +221,7 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	// Agent answers take seconds to minutes; keep the "typing…" indicator
 	// alive (Telegram drops it after ~5s) until the handler returns.
 	stopTyping := b.startTyping(ctx, msg.Chat.ID)
-	text, err := b.handler.Handle(ctx, msg)
+	rep, err := b.handler.Handle(ctx, msg)
 	stopTyping()
 	if err != nil {
 		span.RecordError(err)
@@ -220,13 +229,25 @@ func (b *Bot) onUpdate(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		b.reply(ctx, log, msg.Chat.ID, "Что-то пошло не так, попробуйте ещё раз.", "")
 		return
 	}
-	span.SetAttributes(tracing.Output(text))
-	if text == "" {
-		return
-	}
+	span.SetAttributes(tracing.Output(rep.Text))
 	// The root span id rides into the 👍/👎 buttons so a later press annotates
 	// this exact trace; empty (tracing disabled) means no buttons.
-	b.reply(ctx, log, msg.Chat.ID, text, tracing.SpanID(span))
+	b.deliver(ctx, log, msg.Chat.ID, rep, tracing.SpanID(span))
+}
+
+// deliver renders a handler result: a clarifying question as an inline keyboard,
+// or a plain answer (with the 👍/👎 buttons keyed to spanID). An empty answer
+// sends nothing. Shared by the real-message path and the synthetic (quick-reply,
+// clarify-resume) paths.
+func (b *Bot) deliver(ctx context.Context, log *slog.Logger, chatID int64, rep Reply, spanID string) {
+	if len(rep.Options) > 0 {
+		b.askQuestion(ctx, log, chatID, rep)
+		return
+	}
+	if rep.Text == "" {
+		return
+	}
+	b.reply(ctx, log, chatID, rep.Text, spanID)
 }
 
 // messageQuestion is the user's text for a trace's root span: the message text,
@@ -381,6 +402,8 @@ func (b *Bot) onCallback(ctx context.Context, q *models.CallbackQuery) {
 		return
 	}
 	switch {
+	case strings.HasPrefix(q.Data, clarifyPrefix):
+		b.onClarifyAnswer(ctx, log, q)
 	case strings.HasPrefix(q.Data, quickReplyPrefix):
 		b.doQuickReply(ctx, log, q)
 	case strings.HasPrefix(q.Data, memForgetPrefix):
@@ -402,7 +425,7 @@ func (b *Bot) answerCallback(ctx context.Context, log *slog.Logger, q *models.Ca
 
 // doQuickReply runs the tapped template question through the agent exactly as
 // if the user had typed it: it echoes the question so the chat reads as a
-// dialog, then answers with the usual "new dialog" button attached.
+// dialog, then answers (or, if the template is ambiguous, asks a follow-up).
 func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
 	question, ok := templateByCallback(q.Data)
 	if !ok || b.handler == nil {
@@ -410,31 +433,163 @@ func (b *Bot) doQuickReply(ctx context.Context, log *slog.Logger, q *models.Call
 	}
 	chatID := q.Message.Message.Chat.ID
 	b.reply(ctx, log, chatID, "❓ "+question, "")
+	b.runSynthetic(ctx, log, &q.From, q.Message.Message.Chat, question, "telegram.quick_reply")
+}
 
-	ctx, span := tracing.Tracer().Start(ctx, "telegram.quick_reply")
+// runSynthetic runs text through the agent as if the user had typed it — under a
+// chain span — and delivers the result (an answer, or a follow-up clarifying
+// question). Shared by quick replies and clarify-question resumes.
+func (b *Bot) runSynthetic(ctx context.Context, log *slog.Logger, user *models.User, chat models.Chat, text, spanName string) {
+	if b.handler == nil {
+		return
+	}
+	chatID := chat.ID
+	ctx, span := tracing.Tracer().Start(ctx, spanName)
 	defer span.End()
 	span.SetAttributes(
 		tracing.SpanKind(tracing.SpanKindChain),
-		tracing.Input(question),
-		attribute.Int64("user_id", q.From.ID),
+		tracing.Input(text),
+		attribute.Int64("user_id", user.ID),
 		attribute.Int64("chat_id", chatID),
 	)
 
-	synthetic := &models.Message{From: &q.From, Chat: q.Message.Message.Chat, Text: question}
+	synthetic := &models.Message{From: user, Chat: chat, Text: text}
 	stopTyping := b.startTyping(ctx, chatID)
-	text, err := b.handler.Handle(ctx, synthetic)
+	rep, err := b.handler.Handle(ctx, synthetic)
 	stopTyping()
 	if err != nil {
 		span.RecordError(err)
-		log.Error("quick-reply handler failed", "err", err)
+		log.Error("synthetic handler failed", "err", err)
 		b.reply(ctx, log, chatID, "Что-то пошло не так, попробуйте ещё раз.", "")
 		return
 	}
-	span.SetAttributes(tracing.Output(text))
-	if text == "" {
+	span.SetAttributes(tracing.Output(rep.Text))
+	b.deliver(ctx, log, chatID, rep, tracing.SpanID(span))
+}
+
+// Clarifying-question buttons. A distinct prefix from quickReplyPrefix ("ask:"):
+// callback_data is capped at 64 bytes, so an option button carries only its
+// index (cq:0, cq:1, …) and the label is recovered from the button itself on
+// callback. cq:custom is the "свой вариант" button — its free-text answer
+// arrives as the next ordinary message.
+const (
+	clarifyPrefix = "cq:"
+	clarifyCustom = "cq:custom"
+	msgAskCustom  = "Напишите свой вариант ответом 👇"
+)
+
+// onClarifyAnswer resumes the dialog after the user taps an option under a
+// clarifying question. The chosen label is read back from the pressed button
+// (callback_data only carries the index), the question message is rewritten to
+// show the choice (which also drops the keyboard), and the choice runs through
+// the agent as the next user turn — the agent resumes from stored history.
+func (b *Bot) onClarifyAnswer(ctx context.Context, log *slog.Logger, q *models.CallbackQuery) {
+	msg := q.Message.Message
+	chatID := msg.Chat.ID
+
+	if q.Data == clarifyCustom {
+		// The answer is still to come as free text; just drop the keyboard and
+		// nudge. The agent already has the question in stored history.
+		b.clearKeyboard(ctx, log, chatID, msg.ID)
+		b.reply(ctx, log, chatID, msgAskCustom, "")
 		return
 	}
-	b.reply(ctx, log, chatID, text, tracing.SpanID(span))
+
+	label := buttonLabel(msg.ReplyMarkup, q.Data)
+	if label == "" {
+		log.Warn("clarify callback with no matching button", "data", q.Data)
+		b.clearKeyboard(ctx, log, chatID, msg.ID)
+		return
+	}
+	b.markAnswered(ctx, log, chatID, msg.ID, msg.Text, label)
+	b.runSynthetic(ctx, log, &q.From, msg.Chat, label, "telegram.clarify_answer")
+}
+
+// askQuestion sends a clarifying question as an inline keyboard: one button per
+// option (callback cq:<idx>), plus an optional "свой вариант" button. The labels
+// live in the buttons, so the choice is recovered from the callback's own
+// message — no server-side pending-question state.
+func (b *Bot) askQuestion(ctx context.Context, log *slog.Logger, chatID int64, rep Reply) {
+	rows := make([][]models.InlineKeyboardButton, 0, len(rep.Options)+1)
+	for i, opt := range rep.Options {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: opt, CallbackData: clarifyPrefix + strconv.Itoa(i)},
+		})
+	}
+	if rep.AllowCustom {
+		rows = append(rows, []models.InlineKeyboardButton{
+			{Text: "✏️ Свой вариант", CallbackData: clarifyCustom},
+		})
+	}
+	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+
+	// Question text can exceed the message limit like any answer; hang the
+	// keyboard under the last chunk.
+	chunks := splitHTML(renderTelegramHTML(rep.Text), maxMessageLen)
+	for i, chunk := range chunks {
+		var m models.ReplyMarkup
+		if i == len(chunks)-1 {
+			m = markup
+		}
+		if _, err := b.api.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:      chatID,
+			Text:        chunk,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: m,
+		}); err != nil {
+			log.Error("sendMessage question failed", "err", err)
+			return
+		}
+	}
+}
+
+// markAnswered rewrites an answered question to show the chosen option under it
+// and removes the keyboard in the same edit (editMessageText without a markup
+// drops it). Plain text, no parse mode: the question came back from Telegram as
+// plain text, so re-sending it can't reject on entities. Best-effort — a failure
+// falls back to a bare keyboard clear.
+func (b *Bot) markAnswered(ctx context.Context, log *slog.Logger, chatID int64, msgID int, question, choice string) {
+	text := strings.TrimSpace(question)
+	if text != "" {
+		text += "\n\n"
+	}
+	text += "✅ " + choice
+	if _, err := b.api.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    chatID,
+		MessageID: msgID,
+		Text:      text,
+	}); err != nil {
+		log.Debug("mark answered failed", "err", err)
+		b.clearKeyboard(ctx, log, chatID, msgID)
+	}
+}
+
+// clearKeyboard removes the inline keyboard from a message (its question is now
+// answered). Best-effort: a failure only leaves stale buttons behind.
+func (b *Bot) clearKeyboard(ctx context.Context, log *slog.Logger, chatID int64, msgID int) {
+	if _, err := b.api.EditMessageReplyMarkup(ctx, &bot.EditMessageReplyMarkupParams{
+		ChatID:    chatID,
+		MessageID: msgID,
+	}); err != nil {
+		log.Debug("clear keyboard failed", "err", err)
+	}
+}
+
+// buttonLabel returns the text of the inline button whose callback_data matches.
+// callback_data only carries the option index (the 64-byte cap rules out the
+// label), so the human-readable choice is recovered from the tapped keyboard.
+func buttonLabel(markup *models.InlineKeyboardMarkup, data string) string {
+	if markup == nil {
+		return ""
+	}
+	for _, row := range markup.InlineKeyboard {
+		for _, btn := range row {
+			if btn.CallbackData == data {
+				return btn.Text
+			}
+		}
+	}
+	return ""
 }
 
 // doMemoryForget deletes the preference behind a delete button, then re-renders
