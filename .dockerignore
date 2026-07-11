@@ -1,12 +1,27 @@
+# Keep the build context small. pyproject.toml + uv.lock are bind-mounted in
+# the deps/dev stages, so they must NOT be ignored.
 .git
-.gitignore
+.github
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .env
-*.md
-Dockerfile
-docker-compose.yml
-Caddyfile
-data/
 *.db
-*.db-shm
 *.db-wal
-.DS_Store
+*.db-shm
+data/
+tests/
+docs/
+*.md
+
+# Go leftovers — not part of the Python image (removed at cutover)
+cmd/
+internal/
+scripts/
+*.go
+go.mod
+go.sum
+.golangci.yml

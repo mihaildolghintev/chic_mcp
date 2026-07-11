@@ -1,0 +1,31 @@
+# Local dev only. Production deploy is Kamal via ../chic-deploy (not this file).
+#
+#   make ci        run lint + typecheck + tests + security in the tooling image
+#   make run       build & run the runtime image locally (needs a .env)
+#
+# The tooling service mounts the source and uses the venv baked at /opt/venv
+# (outside /app), so the bind mount doesn't shadow installed dependencies.
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+      args:
+        VERSION: dev
+    env_file: [.env]
+    ports:
+      - "8080:8080"
+    volumes:
+      - chic_data:/data
+
+  tooling:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - ./:/app
+    working_dir: /app
+
+volumes:
+  chic_data: {}

@@ -1,35 +1,51 @@
-# Build stage
-FROM golang:1.25 AS build
-WORKDIR /src
+# syntax=docker/dockerfile:1
+#
+# Deploy contract (../chic-deploy/config/deploy.yml — do not change it):
+#   - Kamal builds THIS Dockerfile with --build-arg VERSION=$(git describe ...)
+#   - cross-built for linux/amd64 from the Apple Silicon laptop
+#   - app must listen on :8080 and answer GET /healthz
+#   - SQLite lives on the chic_data volume at /data (must be writable by the
+#     runtime user — we pre-create /data owned by the app user, like the Go image)
+#
+# uv-based multi-stage build. All stages share one base so the venv interpreter
+# path (/opt/venv) matches across the COPY --from boundary.
 
-# Cache dependencies first.
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-# Version is passed in (the .git tree is dockerignored, so the toolchain can't
-# derive it). Build with: docker build --build-arg VERSION=$(git describe ...).
-ARG VERSION=dev
-# CGO disabled so the binary is fully static (matches modernc.org/sqlite, the
-# pure-Go SQLite driver) — keeps the runtime image tiny and cross-compilable.
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags="-s -w -X mcp.chic.md/internal/buildinfo.Version=${VERSION}" \
-    -o /out/server ./cmd/server
-# Staging dir for the runtime /data mount point (see COPY --chown below).
-RUN mkdir -p /out/data
-
-# Runtime stage
-FROM gcr.io/distroless/static-debian13:nonroot
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS base
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
 WORKDIR /app
-COPY --from=build /out/server /app/server
-# Pre-create /data owned by nonroot: a fresh named volume mounted there
-# inherits this ownership, so SQLite can create its files (no shell in
-# distroless to chown at runtime).
-COPY --from=build --chown=nonroot:nonroot /out/data /data
+
+# --- production dependencies only ---
+FROM base AS deps
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --frozen --no-install-project --no-dev
+
+# --- dev deps for the tooling container (ruff/mypy/pytest/bandit/pip-audit/uv) ---
+# Source is bind-mounted by docker-compose at run time, not copied in.
+FROM base AS dev
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --frozen --no-install-project
+CMD ["bash"]
+
+# --- runtime image (what chic-deploy ships) ---
+FROM base AS runtime
+ARG VERSION=dev
+ENV APP_VERSION=${VERSION}
+COPY --from=deps /opt/venv /opt/venv
+RUN groupadd --system app \
+    && useradd --system --gid app --home-dir /app --no-create-home app \
+    && mkdir -p /data && chown app:app /data
+COPY --chown=app:app chic/ /app/chic/
+USER app
 EXPOSE 8080
-USER nonroot:nonroot
-# No shell/curl in distroless — the binary probes its own /healthz (bot mode,
-# the container default).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/app/server", "-health-check"]
-ENTRYPOINT ["/app/server"]
+    CMD ["python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
+ENTRYPOINT ["python", "-m", "chic"]
