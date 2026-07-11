@@ -1,81 +1,69 @@
-# MoySklad MCP server — local build & run helpers.
-# Pure Go (no CGO), so `make build` produces a native binary on Apple Silicon.
+# All tooling runs inside Docker — nothing is installed on the host except Docker.
+# The tooling image (target: dev) carries ruff, mypy, pytest, bandit, pip-audit
+# and uv; gitleaks runs from its own image.
 
-BINARY := moysklad-mcp
-BIN_DIR := bin
-INSTALL_DIR := $(HOME)/.local/bin
-CACHE_DIR := $(HOME)/.moysklad-mcp
+COMPOSE := docker compose
+TOOL    := $(COMPOSE) run --rm tooling
+GITLEAKS_IMG := zricethezav/gitleaks:latest
 
-# Version stamped into the binary (see internal/buildinfo). Falls back to "dev"
-# outside a git checkout. The git revision/time are embedded by the toolchain.
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X mcp.chic.md/internal/buildinfo.Version=$(VERSION)
+.PHONY: help
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-.PHONY: build install test fmt vet ci clean run-stdio run-bot config
+.PHONY: lock
+lock: ## Regenerate uv.lock from pyproject.toml
+	$(TOOL) uv lock
 
-## build: compile a native static binary into ./bin
-build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) ./cmd/server
-	@echo "built $(BIN_DIR)/$(BINARY) $(VERSION) ($$(go env GOOS)/$$(go env GOARCH))"
+.PHONY: sync
+sync: ## (Re)build the tooling image after dependency changes
+	$(COMPOSE) build tooling
 
-## install: build and copy the binary to ~/.local/bin
-install: build
-	@mkdir -p $(INSTALL_DIR)
-	cp $(BIN_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
-	@echo "installed to $(INSTALL_DIR)/$(BINARY)"
+.PHONY: fmt
+fmt: ## Auto-format with ruff
+	$(TOOL) ruff format .
 
-## test: run the full test suite with the race detector
-test:
-	go test -race ./...
+.PHONY: lint
+lint: ## Check formatting + lint (ruff)
+	$(TOOL) sh -c "ruff format --check . && ruff check ."
 
-fmt:
-	gofmt -w .
+.PHONY: typecheck
+typecheck: ## Static types (mypy --strict)
+	$(TOOL) mypy
 
-vet:
-	go vet ./...
+.PHONY: test
+test: ## Run tests (pytest)
+	$(TOOL) pytest -q
 
-## ci: run the full CI suite locally (lint, build, race tests, security) before a PR
-ci:
-	./scripts/ci.sh
+.PHONY: security
+security: ## Static security scan + dependency audit + secret scan
+	$(TOOL) sh -c "bandit -q -r chic && pip-audit"
+	docker run --rm -v $(PWD):/repo $(GITLEAKS_IMG) detect --source=/repo --no-banner --redact
 
-clean:
-	rm -rf $(BIN_DIR)
+.PHONY: ci
+ci: lint typecheck test security ## Everything CI runs
 
-## run-stdio: run locally over stdio (needs MOYSKLAD_TOKEN in the environment)
-run-stdio: build
-	MOYSKLAD_TOKEN=$${MOYSKLAD_TOKEN:?set MOYSKLAD_TOKEN} \
-	CACHE_DB=$(CACHE_DIR)/cache.db \
-	$(BIN_DIR)/$(BINARY) -transport stdio
+.PHONY: migrate
+migrate: ## Apply DB migrations to ./app.db (the app also does this on startup)
+	$(TOOL) alembic upgrade head
 
-## run-bot: run the Telegram bot locally on :8080 (pair with a cloudflared
-## tunnel; PUBLIC_BASE_URL must be the tunnel's https URL). OPENAI_API_KEY is
-## optional — it enables photo understanding.
-run-bot: build
-	@mkdir -p $(CACHE_DIR)
-	TELEGRAM_BOT_TOKEN=$${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN} \
-	TELEGRAM_WEBHOOK_SECRET=$${TELEGRAM_WEBHOOK_SECRET:?set TELEGRAM_WEBHOOK_SECRET} \
-	ALLOWED_USER_IDS=$${ALLOWED_USER_IDS:?set ALLOWED_USER_IDS} \
-	PUBLIC_BASE_URL=$${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the tunnel url} \
-	MOYSKLAD_TOKEN=$${MOYSKLAD_TOKEN:?set MOYSKLAD_TOKEN} \
-	DEEPSEEK_API_KEY=$${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY} \
-	CACHE_DB=$(CACHE_DIR)/cache.db \
-	APP_DB=$(CACHE_DIR)/app.db \
-	$(BIN_DIR)/$(BINARY)
+.PHONY: migration
+migration: ## Autogenerate a migration: make migration m="add x" (run migrate first)
+	$(TOOL) alembic revision --autogenerate -m "$(m)"
 
-## config: print a ready-to-paste Claude Desktop connector config
-config: install
-	@mkdir -p $(CACHE_DIR)
-	@echo 'Add this to ~/Library/Application Support/Claude/claude_desktop_config.json:'
-	@echo ''
-	@echo '{'
-	@echo '  "mcpServers": {'
-	@echo '    "moysklad": {'
-	@echo '      "command": "$(INSTALL_DIR)/$(BINARY)",'
-	@echo '      "args": ["-transport", "stdio"],'
-	@echo '      "env": {'
-	@echo '        "MOYSKLAD_TOKEN": "PUT-YOUR-MOYSKLAD-TOKEN-HERE",'
-	@echo '        "CACHE_DB": "$(CACHE_DIR)/cache.db"'
-	@echo '      }'
-	@echo '    }'
-	@echo '  }'
-	@echo '}'
+.PHONY: build
+build: ## Build the production runtime image
+	$(COMPOSE) build app
+
+.PHONY: run
+run: ## Run the runtime image locally (needs .env)
+	$(COMPOSE) up --build app
+
+.PHONY: shell
+shell: ## Open a shell in the tooling container
+	$(TOOL) bash
+
+.PHONY: clean
+clean: ## Remove caches and local volumes
+	$(COMPOSE) down -v --remove-orphans
+	rm -rf .pytest_cache .mypy_cache .ruff_cache

@@ -20,3 +20,13 @@ coverage.out
 
 # OS / editor
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

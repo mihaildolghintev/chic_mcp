@@ -1,0 +1,12 @@
+# gitleaks config. Extends the default ruleset and allowlists the env template,
+# which contains only documented placeholders (no real secrets). Without this,
+# high-entropy placeholders like a "min 24 chars" token trip the generic rule.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = ".env.example holds only placeholder values"
+paths = [
+  '''\.env\.example$''',
+]
