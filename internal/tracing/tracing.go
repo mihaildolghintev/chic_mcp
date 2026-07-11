@@ -73,7 +73,7 @@ func SpanKind(kind string) attribute.KeyValue { return attribute.String(keySpanK
 // Input/Output record the span's payload. The JSON variants tell Phoenix to
 // pretty-print the value; use them for messages and tool arguments, the plain
 // variants for a user question or a final answer.
-func Input(v string) attribute.KeyValue     { return attribute.String(keyInputValue, v) }
+func Input(v string) attribute.KeyValue { return attribute.String(keyInputValue, v) }
 func InputJSON(v string) []attribute.KeyValue {
 	return []attribute.KeyValue{attribute.String(keyInputValue, v), attribute.String(keyInputMime, mimeJSON)}
 }
