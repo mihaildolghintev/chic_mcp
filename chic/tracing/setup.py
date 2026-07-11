@@ -38,29 +38,35 @@ def configure_tracing(
         logger.info("tracing disabled (no PHOENIX_COLLECTOR_ENDPOINT)")
         return lambda: None
 
-    from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from pydantic_ai import Agent
+    try:
+        from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from pydantic_ai import Agent
 
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version,
-            "deployment.environment": environment,
-        }
-    )
-    provider = TracerProvider(resource=resource)
-    # Enrich pydantic-ai's native spans into OpenInference conventions, then export.
-    provider.add_span_processor(OpenInferenceSpanProcessor())
-    exporter = OTLPSpanExporter(endpoint=endpoint.rstrip("/") + "/v1/traces")
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
+        resource = Resource.create(
+            {
+                "service.name": service_name,
+                "service.version": service_version,
+                "deployment.environment": environment,
+            }
+        )
+        provider = TracerProvider(resource=resource)
+        # Enrich pydantic-ai's native spans into OpenInference conventions, then export.
+        provider.add_span_processor(OpenInferenceSpanProcessor())
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint.rstrip("/") + "/v1/traces"))
+        )
+        trace.set_tracer_provider(provider)
+        # Make pydantic-ai emit OTel spans (LLM calls, tool calls).
+        Agent.instrument_all()
+    except Exception:
+        # Observability must never crash the app.
+        logger.exception("tracing setup failed; continuing without it")
+        return lambda: None
 
-    # Make pydantic-ai emit OTel spans (LLM calls, tool calls).
-    Agent.instrument_all()
     logger.info("tracing enabled → %s", endpoint)
 
     def shutdown() -> None:

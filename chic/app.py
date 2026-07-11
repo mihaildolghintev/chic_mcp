@@ -1,12 +1,19 @@
 """FastAPI application: healthz, the Telegram webhook, and full startup wiring.
 
-On startup the lifespan wires tracing → store → cache → MoySklad client → MCP
-server → agent → bot, and registers the Telegram webhook. Set ``wire=False`` to
-build a routes-only app (used by tests) with no network or bot construction.
+Startup readiness is decoupled from external services: the lifespan does only
+fast local setup (tracing install, SQLite migrate, client/agent/bot build) and
+yields immediately, so ``/healthz`` and the socket come up in ~1s. The
+network-dependent steps — resolving the account currency (MoySklad) and
+registering the Telegram webhook — run in a background task, so a slow or
+firewalled upstream can never block the health check (and fail the deploy).
+
+Set ``wire=False`` for a routes-only app (tests): no network, no bot.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -39,11 +46,10 @@ async def _resolve_currency(api: Source) -> tuple[str, str]:
     return cur.iso_code, cur.name
 
 
-async def _build_bot(settings: Settings, store: Store, api: Source) -> ChicBot:
-    currency_code, currency_name = await _resolve_currency(api)
-    mcp_server = build_server(api)
-    agent = await ChicAgent.create(
-        fastmcp=mcp_server,
+async def _build_agent(settings: Settings, store: Store, api: Source) -> ChicAgent:
+    # Built with neutral currency; resolved in the background after startup.
+    return await ChicAgent.create(
+        fastmcp=build_server(api),
         store=store,
         deepseek_api_key=settings.deepseek_api_key,
         deepseek_model=settings.deepseek_model,
@@ -51,11 +57,11 @@ async def _build_bot(settings: Settings, store: Store, api: Source) -> ChicBot:
         openai_api_key=settings.openai_api_key,
         openai_model=settings.openai_model,
         openai_base_url=settings.openai_base_url,
-        currency_code=currency_code,
-        currency_name=currency_name,
         summary_char_budget=settings.summary_char_budget,
     )
 
+
+def _make_bot(settings: Settings, agent: ChicAgent) -> ChicBot:
     annotator = PhoenixAnnotator.from_env(
         settings.phoenix_collector_endpoint, os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
     )
@@ -81,6 +87,20 @@ async def _build_bot(settings: Settings, store: Store, api: Source) -> ChicBot:
     )
 
 
+async def _startup_network(settings: Settings, agent: ChicAgent, bot: ChicBot, api: Source) -> None:
+    """Best-effort, off the critical path: currency labels + webhook registration."""
+    code, name = await _resolve_currency(api)
+    if code:
+        agent.set_currency(code, name)
+    try:
+        url = settings.public_base_url.rstrip("/") + "/tg/" + settings.telegram_webhook_secret
+        await bot.register_webhook(url)
+        me = await bot.me()
+        logger.info("bot @%s ready, webhook registered", me.username)
+    except Exception:
+        logger.exception("webhook registration failed")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -90,6 +110,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_version=APP_VERSION,
         environment=settings.app_env,
     )
+    # All local, fast: never blocks the health check.
     store = await Store.open(settings.app_db)
     ms_client = MoyskladClient(settings.moysklad_token)
     cache_store: CacheStore | None = None
@@ -99,22 +120,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         cache_store.start_janitor(600)
         api = CachingClient(ms_client, cache_store)
 
-    bot = await _build_bot(settings, store, api)
+    agent = await _build_agent(settings, store, api)
+    bot = _make_bot(settings, agent)
     app.state.bot = bot
 
-    try:
-        webhook_url = (
-            settings.public_base_url.rstrip("/") + "/tg/" + settings.telegram_webhook_secret
-        )
-        await bot.register_webhook(webhook_url)
-        me = await bot.me()
-        logger.info("bot @%s ready, webhook registered", me.username)
-    except Exception:
-        logger.exception("webhook registration failed")
+    # Network I/O runs after we yield, so the socket binds and /healthz answers now.
+    bg = asyncio.create_task(_startup_network(settings, agent, bot, api))
 
     try:
         yield
     finally:
+        bg.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await bg
         await bot.close()
         await ms_client.aclose()
         if cache_store is not None:

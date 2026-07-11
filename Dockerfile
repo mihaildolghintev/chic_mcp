@@ -46,6 +46,8 @@ RUN groupadd --system app \
 COPY --chown=app:app chic/ /app/chic/
 USER app
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+# Frequent checks + a start grace period so a healthy app is detected within the
+# proxy's deploy window even on a cold start (heavy imports + migrations).
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=6 \
     CMD ["python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
 ENTRYPOINT ["python", "-m", "chic"]
