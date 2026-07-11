@@ -48,8 +48,8 @@ type Option func(*Client)
 // documented 45 requests / 3 seconds.
 func NewClient(token string, opts ...Option) *Client {
 	c := &Client{
-		baseURL:    DefaultBaseURL,
-		token:      token,
+		baseURL: DefaultBaseURL,
+		token:   token,
 		// Instrumented transport: each MoySklad call becomes a child HTTP span
 		// under the TOOL span, separating upstream latency from our own. A no-op
 		// when tracing is disabled.
