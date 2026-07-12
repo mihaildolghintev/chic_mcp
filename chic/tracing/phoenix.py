@@ -1,45 +1,34 @@
 """Phoenix feedback annotations — the 👍/👎 write path.
 
-POSTs a span annotation to Phoenix's REST API so an audit can filter traces down
-to thumbs-down dialogs. Best-effort and no-op when Phoenix isn't configured.
+Writes span annotations through the official ``arize-phoenix-client`` so an audit
+can filter traces down to thumbs-down dialogs. Best-effort and a no-op when Phoenix
+isn't configured. Auth (``PHOENIX_API_KEY`` / ``PHOENIX_CLIENT_HEADERS``) is read
+from the environment by the client itself.
 """
 
 from __future__ import annotations
 
 import logging
-from urllib.parse import unquote
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    from phoenix.client import AsyncClient
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_headers(raw: str) -> dict[str, str]:
-    """Parse ``k=v,k2=v2`` (OTEL_EXPORTER_OTLP_HEADERS), percent-decoding values."""
-    out: dict[str, str] = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if not pair or "=" not in pair:
-            continue
-        key, _, value = pair.partition("=")
-        out[key.strip()] = unquote(value.strip())
-    return out
-
-
 class PhoenixAnnotator:
-    def __init__(self, endpoint: str, headers: dict[str, str] | None = None) -> None:
+    def __init__(self, endpoint: str | None) -> None:
         endpoint = (endpoint or "").strip()
-        self._enabled = bool(endpoint)
-        self._url = endpoint.rstrip("/") + "/v1/span_annotations?sync=false" if endpoint else ""
-        self._headers = {"Content-Type": "application/json", **(headers or {})}
+        self._client: AsyncClient | None = None
+        if endpoint:
+            from phoenix.client import AsyncClient
 
-    @classmethod
-    def from_env(cls, endpoint: str | None, headers_env: str = "") -> PhoenixAnnotator:
-        return cls(endpoint or "", _parse_headers(headers_env))
+            self._client = AsyncClient(base_url=endpoint)
 
     @property
     def enabled(self) -> bool:
-        return self._enabled
+        return self._client is not None
 
     async def annotate(
         self,
@@ -50,23 +39,17 @@ class PhoenixAnnotator:
         score: float,
         identifier: str = "",
     ) -> None:
-        if not self._enabled or not span_id:
+        if self._client is None or not span_id:
             return
-        payload = {
-            "data": [
-                {
-                    "span_id": span_id,
-                    "name": name,
-                    "annotator_kind": "HUMAN",
-                    "result": {"label": label, "score": score},
-                    "identifier": identifier,
-                }
-            ]
-        }
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(self._url, json=payload, headers=self._headers)
-            if resp.status_code >= 300:
-                logger.warning("phoenix annotation rejected: %d", resp.status_code)
-        except httpx.HTTPError:
+            await self._client.spans.add_span_annotation(
+                span_id=span_id,
+                annotation_name=name,
+                annotator_kind="HUMAN",
+                label=label,
+                score=score,
+                identifier=identifier,
+                sync=False,
+            )
+        except Exception:
             logger.warning("phoenix annotation failed", exc_info=True)
