@@ -19,15 +19,21 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from chic.cache.store import CacheStore
 from chic.moysklad.documents import DocumentType
 from chic.moysklad.models import (
+    AssortmentRow,
+    AuditRow,
     Counterparty,
     CounterpartyRow,
     Currency,
     Dashboard,
     Document,
+    EntityRef,
     MoneySeries,
     Product,
     ProfitByEntityRow,
     ProfitByProductRow,
+    SalesSeries,
+    State,
+    StockByStoreRow,
     StockRow,
     TurnoverRow,
 )
@@ -42,6 +48,9 @@ class Source(Protocol):
     async def list_products(self, opts: ListOptions) -> list[Product]: ...
     async def search_counterparties(self, opts: ListOptions) -> list[Counterparty]: ...
     async def account_currency(self) -> Currency: ...
+    async def list_entity_refs(self, entity: str, opts: ListOptions) -> list[EntityRef]: ...
+    async def search_assortment(self, opts: ListOptions) -> list[AssortmentRow]: ...
+    async def list_states(self, doc_type: DocumentType | str) -> list[State]: ...
     async def get_dashboard(self, period: str) -> Dashboard: ...
     async def profit_by_product(
         self, variant: bool, opts: ProfitOptions
@@ -57,6 +66,19 @@ class Source(Protocol):
     async def get_money_series(
         self, date_from: str, date_to: str, interval: str
     ) -> MoneySeries: ...
+    async def get_stock_by_store(self, opts: StockOptions) -> list[StockByStoreRow]: ...
+    async def get_sales_series(
+        self,
+        kind: str,
+        date_from: str,
+        date_to: str,
+        interval: str,
+        *,
+        store_id: str = "",
+        organization_id: str = "",
+        project_id: str = "",
+    ) -> SalesSeries: ...
+    async def get_audit(self, filters: list[str], limit: int) -> list[AuditRow]: ...
     async def search_documents(
         self, doc_type: DocumentType | str, query: DocumentQuery
     ) -> list[Document]: ...
@@ -71,10 +93,12 @@ class TTLs:
 
     products: float = 30 * 60
     dashboard: float = 5 * 60
-    reports: float = 10 * 60  # profit, turnover, stock, counterparty, money
+    reports: float = 10 * 60  # profit, turnover, stock, counterparty, money, sales
     documents: float = 5 * 60
     counterparty: float = 30 * 60  # entity/counterparty search
     currency: float = 24 * 60 * 60
+    references: float = 60 * 60  # stores, orgs, channels, states, assortment…
+    audit: float = 60  # change log — near-live
 
 
 # Adapters for (de)serializing each return type to/from the cache blob.
@@ -90,6 +114,12 @@ _A_COUNTERPARTY_REPORT = TypeAdapter(list[CounterpartyRow])
 _A_MONEY = TypeAdapter(MoneySeries)
 _A_DOCUMENTS = TypeAdapter(list[Document])
 _A_DOCUMENT = TypeAdapter(Document)
+_A_ENTITY_REFS = TypeAdapter(list[EntityRef])
+_A_ASSORTMENT = TypeAdapter(list[AssortmentRow])
+_A_STATES = TypeAdapter(list[State])
+_A_STOCK_BY_STORE = TypeAdapter(list[StockByStoreRow])
+_A_SALES = TypeAdapter(SalesSeries)
+_A_AUDIT = TypeAdapter(list[AuditRow])
 
 
 def _json_default(obj: Any) -> Any:
@@ -160,6 +190,33 @@ class CachingClient:
             lambda: self._src.account_currency(),
         )
 
+    async def list_entity_refs(self, entity: str, opts: ListOptions) -> list[EntityRef]:
+        return await self._cached(
+            self._ttls.references,
+            "ListEntityRefs",
+            [entity, opts],
+            _A_ENTITY_REFS,
+            lambda: self._src.list_entity_refs(entity, opts),
+        )
+
+    async def search_assortment(self, opts: ListOptions) -> list[AssortmentRow]:
+        return await self._cached(
+            self._ttls.references,
+            "SearchAssortment",
+            opts,
+            _A_ASSORTMENT,
+            lambda: self._src.search_assortment(opts),
+        )
+
+    async def list_states(self, doc_type: DocumentType | str) -> list[State]:
+        return await self._cached(
+            self._ttls.references,
+            "ListStates",
+            str(doc_type),
+            _A_STATES,
+            lambda: self._src.list_states(doc_type),
+        )
+
     async def get_dashboard(self, period: str) -> Dashboard:
         return await self._cached(
             self._ttls.dashboard,
@@ -227,6 +284,51 @@ class CachingClient:
             [date_from, date_to, interval],
             _A_MONEY,
             lambda: self._src.get_money_series(date_from, date_to, interval),
+        )
+
+    async def get_stock_by_store(self, opts: StockOptions) -> list[StockByStoreRow]:
+        return await self._cached(
+            self._ttls.reports,
+            "GetStockByStore",
+            opts,
+            _A_STOCK_BY_STORE,
+            lambda: self._src.get_stock_by_store(opts),
+        )
+
+    async def get_sales_series(
+        self,
+        kind: str,
+        date_from: str,
+        date_to: str,
+        interval: str,
+        *,
+        store_id: str = "",
+        organization_id: str = "",
+        project_id: str = "",
+    ) -> SalesSeries:
+        return await self._cached(
+            self._ttls.reports,
+            "GetSalesSeries",
+            [kind, date_from, date_to, interval, store_id, organization_id, project_id],
+            _A_SALES,
+            lambda: self._src.get_sales_series(
+                kind,
+                date_from,
+                date_to,
+                interval,
+                store_id=store_id,
+                organization_id=organization_id,
+                project_id=project_id,
+            ),
+        )
+
+    async def get_audit(self, filters: list[str], limit: int) -> list[AuditRow]:
+        return await self._cached(
+            self._ttls.audit,
+            "GetAudit",
+            [filters, limit],
+            _A_AUDIT,
+            lambda: self._src.get_audit(filters, limit),
         )
 
     async def search_documents(

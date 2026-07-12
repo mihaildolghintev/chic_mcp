@@ -8,6 +8,8 @@ explicit alias is ``class`` (a Python keyword). Serialize with
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -192,11 +194,92 @@ class DocumentDetail(DocumentSummary):
     vat_sum: float = 0.0
     payment_due_date: str = ""
     positions: list[PositionRow] = Field(default_factory=list)
+    attributes: dict[str, Any] = Field(default_factory=dict)
 
 
 class DocumentTotals(OutModel):
     sum: float
     paid: float
+
+
+# ---- reference dictionaries -----------------------------------------------
+
+
+class EntityRefOut(OutModel):
+    id: str
+    name: str
+    code: str = ""
+    archived: bool = False
+    description: str = ""
+    path_name: str = ""
+    inn: str = ""
+
+
+class StateOut(OutModel):
+    id: str
+    name: str
+    type: str = ""  # Regular | Successful | Unsuccessful
+    entity_type: str = ""
+
+
+# ---- assortment -----------------------------------------------------------
+
+
+class AssortmentLine(OutModel):
+    id: str
+    kind: str  # product | variant | bundle | service | consignment
+    name: str
+    code: str = ""
+    article: str = ""
+    sale_price: float = 0.0
+    buy_price: float = 0.0
+    stock: float = 0.0
+
+
+# ---- stock by store -------------------------------------------------------
+
+
+class StoreStockLine(OutModel):
+    store: str
+    positions: int
+    units: float
+    reserve: float
+    available: float
+
+
+class StoreStockTotals(OutModel):
+    stores: int
+    units: float
+    reserve: float
+    available: float
+
+
+# ---- sales / orders series ------------------------------------------------
+
+
+class SalesSeriesPointOut(OutModel):
+    date: str
+    quantity: float
+    sum: float
+
+
+class SalesSeriesOut(OutModel):
+    kind: str  # sales | orders
+    total_quantity: float
+    total_sum: float
+    series: list[SalesSeriesPointOut] = Field(default_factory=list)
+
+
+# ---- audit ----------------------------------------------------------------
+
+
+class AuditLine(OutModel):
+    moment: str
+    employee: str = ""
+    entity_type: str = ""
+    event_type: str = ""
+    object_count: int = 0
+    source: str = ""
 
 
 # ---- product --------------------------------------------------------------

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from chic.aggregate.models import (
     DocumentDetail,
     DocumentSummary,
@@ -12,6 +14,21 @@ from chic.aggregate.models import (
 from chic.aggregate.money import minor_to_major, round2
 from chic.aggregate.report import _truncate
 from chic.moysklad.models import Document
+
+
+def _attr_value(value: Any) -> Any:
+    """Flatten a custom-attribute value to a display scalar.
+
+    Custom-entity / linked attributes arrive as objects carrying their own
+    ``name``; simple attributes are scalars already.
+    """
+    if isinstance(value, dict):
+        return value.get("name") or value.get("value") or ""
+    return value
+
+
+def _attributes(d: Document) -> dict[str, Any]:
+    return {a.name: _attr_value(a.value) for a in d.attributes if a.name}
 
 
 def document_summary_of(d: Document) -> DocumentSummary:
@@ -74,4 +91,5 @@ def document_detail_of(d: Document) -> DocumentDetail:
         vat_sum=minor_to_major(d.vat_sum),
         payment_due_date=d.payment_planned_moment,
         positions=positions,
+        attributes=_attributes(d),
     )

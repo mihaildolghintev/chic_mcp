@@ -19,16 +19,23 @@ from chic.moysklad.dates import normalize_moment, normalize_moment_end
 from chic.moysklad.documents import DocumentType, valid_document_type
 from chic.moysklad.errors import MoyskladError, parse_api_error
 from chic.moysklad.models import (
+    AssortmentRow,
+    AuditRow,
     Counterparty,
     CounterpartyRow,
     Currency,
     Dashboard,
     Document,
+    EntityMetadata,
+    EntityRef,
     ListResponse,
     MoneySeries,
     Product,
     ProfitByEntityRow,
     ProfitByProductRow,
+    SalesSeries,
+    State,
+    StockByStoreRow,
     StockRow,
     TurnoverRow,
 )
@@ -146,8 +153,9 @@ class MoyskladClient:
         base_params: QueryParams,
         total_limit: int,
         parse: Callable[[bytes], ListResponse[T]],
+        page_size: int | None = None,
     ) -> list[T]:
-        page_size = self._page_limit
+        page_size = page_size or self._page_limit
         if 0 < total_limit < page_size:
             page_size = total_limit
 
@@ -199,6 +207,32 @@ class MoyskladClient:
         if rows:
             return rows[0]
         raise MoyskladError(0, "no account currency found")
+
+    async def list_entity_refs(self, entity: str, opts: ListOptions) -> list[EntityRef]:
+        """List a reference dictionary (store, organization, saleschannel,
+        employee, project, expenseitem, productfolder, contract…) as lean refs."""
+        return await self._paginate(
+            f"/entity/{entity}",
+            opts.values(),
+            opts.limit,
+            lambda b: ListResponse[EntityRef].model_validate_json(b),
+        )
+
+    async def search_assortment(self, opts: ListOptions) -> list[AssortmentRow]:
+        """Unified catalog: products, variants, bundles and services in one search."""
+        return await self._paginate(
+            "/entity/assortment",
+            opts.values(),
+            opts.limit,
+            lambda b: ListResponse[AssortmentRow].model_validate_json(b),
+        )
+
+    async def list_states(self, doc_type: DocumentType | str) -> list[State]:
+        """Document statuses for a type, from its ``/entity/{type}/metadata``."""
+        if not valid_document_type(str(doc_type)):
+            raise ValueError(f"moysklad: unsupported document type {doc_type!r}")
+        body = await self._do_get(f"/entity/{doc_type}/metadata", [])
+        return EntityMetadata.model_validate_json(body).states
 
     # ---- report endpoints -------------------------------------------------
 
@@ -268,6 +302,60 @@ class MoyskladClient:
         body = await self._do_get("/report/money/plotseries", params)
         return MoneySeries.model_validate_json(body)
 
+    async def get_stock_by_store(self, opts: StockOptions) -> list[StockByStoreRow]:
+        params = opts.values()
+        return await self._paginate(
+            "/report/stock/bystore",
+            params,
+            opts.limit,
+            lambda b: ListResponse[StockByStoreRow].model_validate_json(b),
+        )
+
+    async def get_sales_series(
+        self,
+        kind: str,
+        date_from: str,
+        date_to: str,
+        interval: str,
+        *,
+        store_id: str = "",
+        organization_id: str = "",
+        project_id: str = "",
+    ) -> SalesSeries:
+        """Sales or orders plot series (`kind` = ``sales`` | ``orders``).
+
+        Both endpoints require momentFrom/momentTo — the caller supplies a period.
+        Optional filters scope to a warehouse, own-company or project.
+        """
+        path = "/report/orders/plotseries" if kind == "orders" else "/report/sales/plotseries"
+        params: QueryParams = []
+        if m := normalize_moment(date_from):
+            params.append(("momentFrom", m))
+        if m := normalize_moment_end(date_to):
+            params.append(("momentTo", m))
+        if interval:
+            params.append(("interval", interval))
+        base = self._base_url
+        if store_id:
+            params.append(("filter", f"store={base}/entity/store/{store_id}"))
+        if organization_id:
+            params.append(("filter", f"organization={base}/entity/organization/{organization_id}"))
+        if project_id:
+            params.append(("filter", f"project={base}/entity/project/{project_id}"))
+        body = await self._do_get(path, params)
+        return SalesSeries.model_validate_json(body)
+
+    async def get_audit(self, filters: list[str], limit: int) -> list[AuditRow]:
+        """Account change log. The ``/audit`` endpoint caps ``limit`` at 100/page."""
+        params: QueryParams = [("filter", f) for f in filters]
+        return await self._paginate(
+            "/audit",
+            params,
+            limit,
+            lambda b: ListResponse[AuditRow].model_validate_json(b),
+            page_size=min(self._page_limit, 100),
+        )
+
     # ---- documents --------------------------------------------------------
 
     async def search_documents(
@@ -275,9 +363,22 @@ class MoyskladClient:
     ) -> list[Document]:
         if not valid_document_type(str(doc_type)):
             raise ValueError(f"moysklad: unsupported document type {doc_type!r}")
+        params = query.values(self._base_url)
+        base = self._base_url
+        if query.organization_id:
+            params.append(
+                ("filter", f"organization={base}/entity/organization/{query.organization_id}")
+            )
+        if query.store_id:
+            params.append(("filter", f"store={base}/entity/store/{query.store_id}"))
+        if query.state_id:
+            # The state href is document-type-scoped.
+            params.append(
+                ("filter", f"state={base}/entity/{doc_type}/metadata/states/{query.state_id}")
+            )
         return await self._paginate(
             f"/entity/{doc_type}",
-            query.values(self._base_url),
+            params,
             query.limit,
             lambda b: ListResponse[Document].model_validate_json(b),
         )

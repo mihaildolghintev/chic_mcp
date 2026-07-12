@@ -8,9 +8,12 @@ returns the uniform truncating envelope: totals over the full set, rows capped.
 from __future__ import annotations
 
 from chic.aggregate.models import (
+    AssortmentLine,
+    AuditLine,
     CounterpartyMetric,
     CounterpartyTotals,
     DashboardSummary,
+    EntityRefOut,
     MoneyFlow,
     MoneyFlowPoint,
     ProductSummary,
@@ -18,19 +21,30 @@ from chic.aggregate.models import (
     ProfitProductLine,
     ProfitTotals,
     Report,
+    SalesSeriesOut,
+    SalesSeriesPointOut,
+    StateOut,
     StockLine,
     StockTotals,
+    StoreStockLine,
+    StoreStockTotals,
     TurnoverLine,
     TurnoverTotals,
 )
 from chic.aggregate.money import margin_pct, minor_to_major, round2
 from chic.moysklad.models import (
+    AssortmentRow,
+    AuditRow,
     CounterpartyRow,
     Dashboard,
+    EntityRef,
     MoneySeries,
     Product,
     ProfitByEntityRow,
     ProfitByProductRow,
+    SalesSeries,
+    State,
+    StockByStoreRow,
     StockRow,
     TurnoverRow,
 )
@@ -302,3 +316,123 @@ def money(m: MoneySeries) -> MoneyFlow:
             for p in m.series
         ],
     )
+
+
+# ---- reference dictionaries -----------------------------------------------
+
+
+def entity_refs(rows: list[EntityRef]) -> list[EntityRefOut]:
+    return [
+        EntityRefOut(
+            id=r.id,
+            name=r.name,
+            code=r.code,
+            archived=r.archived,
+            description=r.description,
+            path_name=r.path_name,
+            inn=r.inn,
+        )
+        for r in rows
+    ]
+
+
+def states(rows: list[State]) -> list[StateOut]:
+    return [
+        StateOut(id=r.id, name=r.name, type=r.state_type, entity_type=r.entity_type) for r in rows
+    ]
+
+
+# ---- assortment -----------------------------------------------------------
+
+
+def _assortment_kind(row: AssortmentRow) -> str:
+    # meta.type is product|variant|bundle|service|consignment.
+    return row.meta.type or "product"
+
+
+def assortment(rows: list[AssortmentRow]) -> list[AssortmentLine]:
+    return [
+        AssortmentLine(
+            id=r.id,
+            kind=_assortment_kind(r),
+            name=r.name,
+            code=r.code,
+            article=r.article,
+            sale_price=minor_to_major(r.sale_prices[0].value) if r.sale_prices else 0.0,
+            buy_price=minor_to_major(r.buy_price.value) if r.buy_price is not None else 0.0,
+            stock=r.quantity,
+        )
+        for r in rows
+    ]
+
+
+# ---- stock by store -------------------------------------------------------
+
+
+def stock_by_store(rows: list[StockByStoreRow]) -> Report[StoreStockLine, StoreStockTotals]:
+    """Pivot per-product/per-store rows into a per-warehouse summary.
+
+    The bystore report carries quantities but not prices, so this aggregates
+    units/reserve/available per store (answering "how much sits where"), not value.
+    """
+    agg: dict[str, StoreStockLine] = {}
+    for row in rows:
+        for s in row.stock_by_store:
+            line = agg.get(s.name)
+            if line is None:
+                line = StoreStockLine(
+                    store=s.name, positions=0, units=0.0, reserve=0.0, available=0.0
+                )
+                agg[s.name] = line
+            if s.stock != 0 or s.reserve != 0 or s.in_transit != 0:
+                line.positions += 1
+            line.units += s.stock
+            line.reserve += s.reserve
+            line.available += s.stock - s.reserve
+    lines = sorted(agg.values(), key=lambda x: x.units, reverse=True)
+    for line in lines:
+        line.units = round2(line.units)
+        line.reserve = round2(line.reserve)
+        line.available = round2(line.available)
+    totals = StoreStockTotals(
+        stores=len(lines),
+        units=round2(sum(x.units for x in lines)),
+        reserve=round2(sum(x.reserve for x in lines)),
+        available=round2(sum(x.available for x in lines)),
+    )
+    return Report[StoreStockLine, StoreStockTotals](
+        totals=totals, row_count=len(lines), returned=len(lines), truncated=False, rows=lines
+    )
+
+
+# ---- sales / orders series ------------------------------------------------
+
+
+def sales_series(kind: str, s: SalesSeries) -> SalesSeriesOut:
+    points = [
+        SalesSeriesPointOut(date=p.date, quantity=p.quantity, sum=minor_to_major(p.sum))
+        for p in s.series
+    ]
+    return SalesSeriesOut(
+        kind=kind,
+        total_quantity=round2(sum(p.quantity for p in points)),
+        total_sum=round2(sum(p.sum for p in points)),
+        series=points,
+    )
+
+
+# ---- audit ----------------------------------------------------------------
+
+
+def audit(rows: list[AuditRow]) -> list[AuditLine]:
+    return [
+        AuditLine(
+            moment=r.moment,
+            employee=r.uid,
+            entity_type=r.entity_type,
+            event_type=r.event_type,
+            object_count=r.object_count,
+            source=r.source,
+        )
+        for r in rows
+    ]

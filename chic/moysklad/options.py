@@ -73,6 +73,13 @@ class DocumentQuery(BaseModel):
     from_: str = ""  # moment >=
     to: str = ""  # moment <=
     counterparty_id: str = ""  # agent filter by id (href built internally)
+    # These are stored as raw UUIDs; the client builds their entity hrefs (the
+    # state href needs the document type, which only the client knows). They are
+    # deliberately part of the model so the cache key varies with them, but they
+    # are NOT emitted by ``values()``.
+    state_id: str = ""
+    organization_id: str = ""
+    store_id: str = ""
     filter: list[str] = []
     search: str = ""
     expand: list[str] = []
