@@ -145,6 +145,10 @@ class ChicBot:
     async def me(self) -> User:
         return await self._bot.get_me()
 
+    async def send(self, chat_id: int, text: str) -> None:
+        """Proactively push a message (e.g. the scheduled digest). HTML-formatted."""
+        await self._bot.send_message(chat_id, text, parse_mode="HTML")
+
     async def close(self) -> None:
         await self._bot.session.close()
 

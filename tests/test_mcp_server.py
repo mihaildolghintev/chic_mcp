@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 import pytest
@@ -157,9 +158,10 @@ async def test_all_tools_registered() -> None:
     server = build_server(FakeAPI())
     tools = await server.list_tools()
     names = {t.name for t in tools}
-    assert len(names) == 22
+    assert len(names) == 23
     assert "get_dashboard" in names
     assert "receivables_aging" in names
+    assert "explain_profit_change" in names
     assert "get_account_currency" in names
     for name in (
         "list_references",
@@ -177,6 +179,43 @@ async def test_get_dashboard_camelcase_output() -> None:
     assert out["salesAmount"] == 5000.0
     assert out["salesDeltaVsPrev"] == 100.0
     assert out["moneyBalance"] == 6000.0
+
+
+async def test_money_serialized_as_json_number_not_string() -> None:
+    # Money is a Decimal internally, but the agent forwards tool output through
+    # ``json.dumps`` (chic/agent/agent.py) — it must stay a bare JSON number so the
+    # model reads a value, not a quoted string. This locks that contract.
+    out = await _call("get_dashboard", {"period": "month"})
+    assert isinstance(out["salesAmount"], float)
+    encoded = json.dumps(out)
+    assert '"salesAmount": 5000.0' in encoded
+    assert '"5000' not in encoded  # not quoted anywhere
+
+
+async def test_explain_profit_change_envelope() -> None:
+    out = await _call(
+        "explain_profit_change",
+        {
+            "period_a_from": "2026-01-01",
+            "period_a_to": "2026-01-31",
+            "period_b_from": "2026-02-01",
+            "period_b_to": "2026-02-28",
+        },
+    )
+    # camelCase envelope with numeric money effects (both periods identical ⇒ zero delta).
+    assert out["delta"] == 0.0
+    for key in (
+        "profitA",
+        "priceEffect",
+        "costEffect",
+        "volumeEffect",
+        "mixEffect",
+        "newProductsEffect",
+        "discontinuedEffect",
+        "rounding",
+    ):
+        assert isinstance(out[key], float)
+    assert isinstance(out["topDrivers"], list)
 
 
 async def test_list_products_wrapped_as_items_count() -> None:

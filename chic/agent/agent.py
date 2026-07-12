@@ -18,22 +18,32 @@ from datetime import datetime
 from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
+from opentelemetry import trace
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, ImageUrl, RunContext
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import UsageLimits
 
+from chic.agent.guardrail import check_answer, collect_known_numbers
 from chic.agent.prompts import (
     CONSOLIDATE_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
     summary_context_block,
     system_prompt,
 )
+from chic.clock import now as account_now
 from chic.store import Message, Preference, Store
 
 logger = logging.getLogger(__name__)
@@ -332,7 +342,7 @@ class ChicAgent:
             currency_name=self._currency_name,
             prefs=prefs,
             summary=summary,
-            now=datetime.now(),
+            now=account_now(),  # account-local wall clock, not container time
         )
 
         stored = text
@@ -372,6 +382,7 @@ class ChicAgent:
             return res
 
         answer = out.strip()
+        _check_grounding(result.all_messages(), text, answer)
         await self._persist(user_id, stored, answer)
         return Result(text=answer)
 
@@ -465,6 +476,50 @@ class ChicAgent:
                 await self._store.append_message(user_id, role, content)
             except Exception:
                 logger.warning("store %s message failed", role, exc_info=True)
+
+
+def _tool_outputs(messages: list[ModelMessage]) -> list[str]:
+    """The string payloads every tool returned this run (grounding source of truth)."""
+    out: list[str] = []
+    for msg in messages:
+        for part in msg.parts:
+            if isinstance(part, ToolReturnPart) and isinstance(part.content, str):
+                out.append(part.content)
+    return out
+
+
+def _check_grounding(messages: list[ModelMessage], user_text: str, answer: str) -> None:
+    """Log-mode grounding pass: record which answer figures aren't in tool output.
+
+    Never alters the answer and never raises into the request path — it is a
+    measurement recorded on the current trace span (and a warning when suspicious).
+    """
+    # The whole body — collection, checking, logging AND span instrumentation — is
+    # inside one guard: a throw from any of them (incl. OTel set_attribute) must
+    # never propagate and drop a reply the model already produced.
+    try:
+        known = collect_known_numbers(_tool_outputs(messages), extra=user_text)
+        report = check_answer(answer, known)
+        if report.unexplained:
+            logger.warning(
+                "grounding: %d/%d figures not traced to tool output: %s",
+                len(report.unexplained),
+                report.checked,
+                report.unexplained[:10],
+            )
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.set_attribute("grounding.numbers_total", report.total)
+            span.set_attribute("grounding.numbers_checked", report.checked)
+            span.set_attribute("grounding.numbers_grounded", report.grounded)
+            span.set_attribute("grounding.unexplained_count", len(report.unexplained))
+            if report.unexplained:
+                span.set_attribute(
+                    "grounding.unexplained",
+                    json.dumps(report.unexplained[:20], ensure_ascii=False),
+                )
+    except Exception:  # pragma: no cover - defensive; grounding must never break a reply
+        logger.debug("grounding check failed", exc_info=True)
 
 
 async def _build_moysklad_tools(fastmcp: FastMCP) -> list[Tool[_Deps]]:

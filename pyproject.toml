@@ -32,6 +32,9 @@ dependencies = [
     "arize-phoenix-client>=1.0",
     "opentelemetry-sdk>=1.29",
     "openinference-instrumentation-pydantic-ai>=0.1",
+    "duckdb>=1.5.4",
+    "apscheduler>=3.11.3",
+    "babel>=2.18.0",
 ]
 
 [dependency-groups]
@@ -75,7 +78,7 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["aiolimiter.*", "telegramify_markdown.*"]
+module = ["aiolimiter.*", "telegramify_markdown.*", "apscheduler.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

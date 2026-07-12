@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     listen_addr: str = ":8080"
     cache_db: str | None = None  # unset ⇒ response cache disabled
     app_db: str = "app.db"
+    history_db: str | None = None  # unset ⇒ snapshot history (XYZ/forecast) disabled
+    jobs_db: str | None = None  # unset ⇒ scheduler disabled; else APScheduler SQLite job store
     log_format: str = "text"  # deploy sets "json"
     log_level: str = "info"
     phoenix_collector_endpoint: str | None = None  # unset ⇒ tracing disabled

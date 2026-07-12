@@ -5,10 +5,17 @@ from pathlib import Path
 
 import pytest_asyncio
 from chic.agent import ChicAgent
-from chic.agent.agent import _clarify_result, _parse_consolidated, _RateLimiter
+from chic.agent.agent import _clarify_result, _parse_consolidated, _RateLimiter, _tool_outputs
 from chic.store import Store
 from mcp.server.fastmcp import FastMCP
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 UID = 7
@@ -82,6 +89,31 @@ async def test_plain_answer_is_persisted(agent: ChicAgent) -> None:
         ("user", "здравствуй"),
         ("assistant", "Привет!"),
     ]
+
+
+def test_tool_outputs_collects_tool_return_strings() -> None:
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="get_dashboard", content='{"moneyBalance": 6000.0}', tool_call_id="c1"
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content="Баланс 6 000")]),
+    ]
+    assert _tool_outputs(messages) == ['{"moneyBalance": 6000.0}']
+
+
+async def test_grounding_does_not_alter_or_block_answer(agent: ChicAgent) -> None:
+    # Even a fabricated figure passes through untouched — grounding only measures.
+    def reply(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content="Баланс 999 999 999 MDL")])
+
+    with agent._agent.override(model=FunctionModel(reply)):
+        result = await agent.handle(UID, "какой баланс?")
+
+    assert result.text == "Баланс 999 999 999 MDL"
 
 
 async def test_clarify_output_returns_a_clarifying_question(agent: ChicAgent) -> None:

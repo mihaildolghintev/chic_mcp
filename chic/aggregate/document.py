@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from chic.aggregate.envelope import truncate
 from chic.aggregate.models import (
     DocumentDetail,
     DocumentSummary,
@@ -11,8 +12,7 @@ from chic.aggregate.models import (
     PositionRow,
     Report,
 )
-from chic.aggregate.money import minor_to_major, round2
-from chic.aggregate.report import _truncate
+from chic.aggregate.money import dec, minor_to_major, money_round
 from chic.moysklad.models import Document
 
 
@@ -56,10 +56,10 @@ def document_summaries(docs: list[Document]) -> list[DocumentSummary]:
 def document_report(docs: list[Document], limit: int) -> Report[DocumentSummary, DocumentTotals]:
     rows = document_summaries(docs)
     totals = DocumentTotals(
-        sum=round2(sum(r.sum for r in rows)),
-        paid=round2(sum(r.paid for r in rows)),
+        sum=money_round(sum((r.sum for r in rows), dec(0))),
+        paid=money_round(sum((r.paid for r in rows), dec(0))),
     )
-    shown, full, truncated = _truncate(rows, limit)
+    shown, full, truncated = truncate(rows, limit)
     return Report[DocumentSummary, DocumentTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -73,7 +73,7 @@ def document_detail_of(d: Document) -> DocumentDetail:
             price = minor_to_major(p.price)
             # MoySklad's document Sum is already net of line discounts, so the
             # line total must subtract the discount too to reconcile with the header.
-            total = price * p.quantity * (1 - p.discount / 100)
+            total = price * dec(p.quantity) * (dec(1) - dec(p.discount) / 100)
             positions.append(
                 PositionRow(
                     name=p.assortment.name,
@@ -82,11 +82,13 @@ def document_detail_of(d: Document) -> DocumentDetail:
                     price=price,
                     discount=p.discount,
                     vat=p.vat,
-                    total=round2(total),
+                    total=money_round(total),
                 )
             )
     return DocumentDetail(
-        **base.model_dump(),
+        # dict(), not model_dump(): keep Money fields as Decimal instead of
+        # round-tripping them through the JSON-only float serializer.
+        **dict(base),
         description=d.description,
         vat_sum=minor_to_major(d.vat_sum),
         payment_due_date=d.payment_planned_moment,
