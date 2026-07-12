@@ -38,7 +38,14 @@ from chic.telegram.keyboards import (
 )
 from chic.telegram.photo import PhotoTooLargeError, photo_data_uri
 from chic.telegram.render import source_chunks, to_markdown_v2
-from chic.tracing import span_id_hex
+from chic.tracing import (
+    CHAIN,
+    add_event,
+    mark_input,
+    mark_output,
+    set_status,
+    span_id_hex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +254,7 @@ class ChicBot:
         self, user_id: int, chat_id: int, text: str, image: str = ""
     ) -> None:
         span_id = ""
+        session_id = await self._agent.session_key(user_id) if self._tracer is not None else ""
         async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
             cm: contextlib.AbstractContextManager[trace.Span | None] = (
                 self._tracer.start_as_current_span("telegram.message")
@@ -255,12 +263,26 @@ class ChicBot:
             )
             with cm as span:
                 span_id = span_id_hex(span)
+                mark_input(
+                    span,
+                    kind=CHAIN,
+                    value=text or ("[фото]" if image else ""),
+                    session_id=session_id,
+                    user_id=str(user_id),
+                    metadata={"has_image": bool(image)},
+                )
                 try:
                     result = await self._agent.handle(user_id, text, image)
                 except Exception:
                     logger.exception("agent handle failed")
+                    set_status(span, ok=False, description="agent handle failed")
                     await self._bot.send_message(chat_id, MSG_ERROR)
                     return
+                mark_output(span, value=result.text)
+                if result.options:
+                    # A clarifying question is a normal turn, not a failure.
+                    add_event(span, "clarify_requested")
+                set_status(span, ok=True)
         await self._deliver(chat_id, result, span_id)
 
     async def _deliver(self, chat_id: int, result: Result, span_id: str) -> None:
