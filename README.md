@@ -151,10 +151,10 @@ trusted pipe.
 ## Test
 
 ```sh
-go test -race ./...
+make test        # pytest inside the tooling container
 ```
 
-Test layers: golden-file client tests (`httptest` + recorded MoySklad JSON),
+Test layers: golden-file client tests (recorded MoySklad JSON),
 aggregation unit tests (kopecks/rubles, empty cases), in-process MCP protocol
 tests (`tools/list`, `tools/call`, schema validity), LLM payload tests for both
 providers, and an end-to-end agent test (scripted LLM → real MCP → fake
@@ -163,7 +163,7 @@ MoySklad).
 ## Deploy
 
 The repo is deployment-agnostic: it ships a [Dockerfile](Dockerfile) that
-builds a single static binary image listening on `LISTEN_ADDR` (default
+builds a Python runtime image listening on `LISTEN_ADDR` (default
 `:8080`) with a health check at `/healthz`, and persists SQLite files at the
 paths given by `CACHE_DB`/`APP_DB` — mount a volume there. Run it anywhere
 that can run a container; see [.env.example](.env.example) for the required
