@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 from datetime import datetime
+from decimal import Decimal
 
+from chic.aggregate.envelope import truncate
 from chic.aggregate.models import (
     ABCItem,
     ABCTotals,
@@ -25,43 +28,54 @@ from chic.aggregate.models import (
 )
 from chic.aggregate.money import (
     days_between,
+    dec,
     minor_to_major,
+    money_round,
     parse_time,
     pct_change,
     round2,
 )
-from chic.aggregate.report import _truncate, counterparty_metrics, stock
+from chic.aggregate.report import counterparty_metrics, stock
 from chic.moysklad.models import CounterpartyRow, Document, StockRow
 
 # ---- ABC analysis ---------------------------------------------------------
 
 
-def abc(pairs: list[tuple[str, float]], a_cut: float = 0.8, b_cut: float = 0.95) -> list[ABCItem]:
-    """Rank (name, value) pairs by value desc and assign A/B/C by cumulative share."""
+def abc(
+    pairs: Sequence[tuple[str, float | Decimal]], a_cut: float = 0.8, b_cut: float = 0.95
+) -> list[ABCItem]:
+    """Rank (name, value) pairs by value desc and assign A/B/C by cumulative share.
+
+    Values are money (kept as Decimal); the cumulative-share ranking runs in float
+    to preserve the original cut behaviour exactly — the class thresholds are
+    ratios, not amounts, so binary-float drift there is immaterial.
+    """
     if a_cut <= 0 or a_cut >= 1:
         a_cut = 0.8
     if b_cut <= a_cut or b_cut >= 1:
         b_cut = 0.95
 
-    total = sum(v for _, v in pairs if v > 0)
-    items = [ABCItem(name=n, value=v) for n, v in pairs]
+    items = [ABCItem(name=n, value=dec(v)) for n, v in pairs]
     items.sort(key=lambda it: it.value, reverse=True)  # stable, ties keep order
+    total = float(sum((it.value for it in items if it.value > 0), dec(0)))
 
     cum = 0.0
     for it in items:
-        v = it.value
+        v = float(it.value)
         if total > 0 and v > 0:
             it.share = round2(v / total * 100)
             cum += v
             it.cumulative_share = round2(cum / total * 100)
         else:
             it.cumulative_share = 100.0
-        denom = max(total, 1.0)
+        # Class off the same cum/total ratio as the displayed cumulative share.
+        # No zero-guard needed: total == 0 ⟺ no positive values ⟺ every item takes
+        # the v <= 0 branch below, so the division only runs when total > 0.
         if v <= 0:
             it.abc_class = "C"
-        elif cum / denom <= a_cut:
+        elif cum / total <= a_cut:
             it.abc_class = "A"
-        elif cum / denom <= b_cut:
+        elif cum / total <= b_cut:
             it.abc_class = "B"
         else:
             it.abc_class = "C"
@@ -70,7 +84,7 @@ def abc(pairs: list[tuple[str, float]], a_cut: float = 0.8, b_cut: float = 0.95)
 
 def abc_report(items: list[ABCItem], limit: int) -> Report[ABCItem, ABCTotals]:
     a = b = c = 0
-    value = 0.0
+    value = dec(0)
     for it in items:
         if it.value > 0:
             value += it.value
@@ -80,8 +94,8 @@ def abc_report(items: list[ABCItem], limit: int) -> Report[ABCItem, ABCTotals]:
             b += 1
         else:
             c += 1
-    totals = ABCTotals(count=len(items), value=round2(value), a_count=a, b_count=b, c_count=c)
-    shown, full, truncated = _truncate(items, limit)
+    totals = ABCTotals(count=len(items), value=money_round(value), a_count=a, b_count=b, c_count=c)
+    shown, full, truncated = truncate(items, limit)
     return Report[ABCItem, ABCTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -112,7 +126,7 @@ def segment_counterparties(
 
     revenues = sorted((m.revenue for m in metrics), reverse=True)
     n = len(revenues)
-    vip_threshold = math.inf
+    vip_threshold: float | Decimal = math.inf
     if n > 0:
         idx = int(n * vip_pct)
         if idx >= n:
@@ -183,7 +197,7 @@ def segment_report(
         negative_margin=tallies["negative_margin"],
     )
     ordered = sorted(segs, key=lambda s: s.revenue, reverse=True)
-    shown, full, truncated = _truncate(ordered, limit)
+    shown, full, truncated = truncate(ordered, limit)
     return Report[CounterpartySegment, SegmentTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -207,7 +221,8 @@ def dead_stock(
         if has_outcome and outcome > 0:
             continue  # it did move ⇒ not dead
         line = stock([r])[0]
-        out.append(DeadStockLine(**line.model_dump(), outcome_qty=outcome))
+        # dict(), not model_dump(): keep Money fields Decimal (no float round-trip).
+        out.append(DeadStockLine(**dict(line), outcome_qty=outcome))
     out.sort(key=lambda x: x.stock_value, reverse=True)
     return out
 
@@ -216,9 +231,9 @@ def dead_stock_report(
     lines: list[DeadStockLine], limit: int
 ) -> Report[DeadStockLine, DeadStockTotals]:
     totals = DeadStockTotals(
-        count=len(lines), stock_value=round2(sum(x.stock_value for x in lines))
+        count=len(lines), stock_value=money_round(sum((x.stock_value for x in lines), dec(0)))
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[DeadStockLine, DeadStockTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -227,45 +242,51 @@ def dead_stock_report(
 # ---- period comparison ----------------------------------------------------
 
 
-def _fold(pairs: list[tuple[str, float]]) -> dict[str, float]:
-    m: dict[str, float] = {}
+def _fold(pairs: Sequence[tuple[str, float | Decimal]]) -> dict[str, Decimal]:
+    m: dict[str, Decimal] = {}
     for k, v in pairs:
-        m[k] = m.get(k, 0.0) + v
+        m[k] = m.get(k, dec(0)) + dec(v)
     return m
 
 
-def _mk_change(k: str, a: float, b: float) -> Change:
+def _mk_change(k: str, a: Decimal, b: Decimal) -> Change:
     return Change(
-        key=k, value_a=round2(a), value_b=round2(b), delta=round2(b - a), delta_pct=pct_change(a, b)
+        key=k,
+        value_a=money_round(a),
+        value_b=money_round(b),
+        delta=money_round(b - a),
+        delta_pct=pct_change(a, b),
     )
 
 
 def compare_periods(
-    a: list[tuple[str, float]], b: list[tuple[str, float]], top_n: int
+    a: Sequence[tuple[str, float | Decimal]],
+    b: Sequence[tuple[str, float | Decimal]],
+    top_n: int,
 ) -> Comparison:
     ma = _fold(a)
     mb = _fold(b)
 
     seen: set[str] = set()
     changes: list[Change] = []
-    total_a = 0.0
-    total_b = 0.0
+    total_a = dec(0)
+    total_b = dec(0)
     for k, va in ma.items():
         seen.add(k)
         total_a += va
-        changes.append(_mk_change(k, va, mb.get(k, 0.0)))
+        changes.append(_mk_change(k, va, mb.get(k, dec(0))))
     for k, vb in mb.items():
         total_b += vb
         if k in seen:
             continue
-        changes.append(_mk_change(k, 0.0, vb))
+        changes.append(_mk_change(k, dec(0), vb))
 
     gainers = sorted(changes, key=lambda c: c.delta, reverse=True)
     decliners = sorted(changes, key=lambda c: c.delta)
     return Comparison(
-        total_a=round2(total_a),
-        total_b=round2(total_b),
-        delta=round2(total_b - total_a),
+        total_a=money_round(total_a),
+        total_b=money_round(total_b),
+        delta=money_round(total_b - total_a),
         delta_pct=pct_change(total_a, total_b),
         top_gainers=[c for c in gainers if c.delta > 0][:top_n],
         top_decliners=[c for c in decliners if c.delta < 0][:top_n],
@@ -292,8 +313,8 @@ def _bucket_index(days_overdue: int) -> int:
 def receivables_aging(docs: list[Document], now: datetime, limit: int) -> Aging:
     buckets = [AgingBucket(label=label) for label in _BUCKET_LABELS]
     items: list[AgingItem] = []
-    total_outstanding = 0.0
-    total_overdue = 0.0
+    total_outstanding = dec(0)
+    total_overdue = dec(0)
 
     for d in docs:
         outstanding = minor_to_major(d.sum - d.payed_sum)
@@ -309,7 +330,7 @@ def receivables_aging(docs: list[Document], now: datetime, limit: int) -> Aging:
 
         bi = _bucket_index(overdue_days)
         buckets[bi].count += 1
-        buckets[bi].amount = round2(buckets[bi].amount + outstanding)
+        buckets[bi].amount = money_round(buckets[bi].amount + outstanding)
         if overdue_days > 0:
             total_overdue += outstanding
 
@@ -331,8 +352,8 @@ def receivables_aging(docs: list[Document], now: datetime, limit: int) -> Aging:
         truncated = True
 
     return Aging(
-        total_outstanding=round2(total_outstanding),
-        total_overdue=round2(total_overdue),
+        total_outstanding=money_round(total_outstanding),
+        total_overdue=money_round(total_overdue),
         buckets=buckets,
         item_count=item_count,
         items_truncated=truncated,

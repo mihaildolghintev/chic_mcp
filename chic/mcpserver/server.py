@@ -1,26 +1,37 @@
 """MoySklad analytics exposed as MCP tools (FastMCP).
 
-Every tool is read-only. `build_server(api)` registers all 15 tools closing over
-the given MoySklad client (raw or cache-wrapped). Reports return the uniform
-`{totals, rowCount, returned, truncated, rows}` envelope so the model uses totals
-rather than re-summing possibly-truncated rows.
+Every tool is read-only. `build_server(api, history)` registers the tools, grouped
+by domain into `_register_*` functions, closing over the given MoySklad client
+(raw or cache-wrapped) and optional snapshot store. Tool bodies are thin: they
+delegate the fetch-and-aggregate orchestration to `chic.usecases` and wrap the
+result for the LLM. Reports return the uniform `{totals, rowCount, returned,
+truncated, rows}` envelope so the model uses totals rather than re-summing
+possibly-truncated rows.
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from chic import aggregate
+from chic import aggregate, usecases
 from chic.aggregate.analytics import SegmentParams
 from chic.aggregate.report import profit_by_entity, profit_by_product
 from chic.cache import Source
-from chic.mcpserver.helpers import as_object, clamp_limit, now, period_days, prev_month
+from chic.history import HistoryStore
+from chic.mcpserver.helpers import (
+    as_object,
+    clamp_limit,
+    ensure_ymd,
+    now,
+    period_days,
+    prev_month,
+)
 from chic.moysklad import (
     DocumentQuery,
-    DocumentType,
     ListOptions,
     ProfitOptions,
     StockOptions,
@@ -118,19 +129,29 @@ _ARCHIVABLE_REFERENCES: frozenset[str] = frozenset(
 )
 
 
-def _product_pairs(rows: list[ProfitByProductRow], metric: str) -> list[tuple[str, float]]:
+def _product_pairs(rows: list[ProfitByProductRow], metric: str) -> list[tuple[str, Decimal]]:
     return [
         (x.name, x.profit if metric == "profit" else x.revenue) for x in profit_by_product(rows)
     ]
 
 
-def _entity_pairs(rows: list[ProfitByEntityRow], metric: str) -> list[tuple[str, float]]:
+def _entity_pairs(rows: list[ProfitByEntityRow], metric: str) -> list[tuple[str, Decimal]]:
     return [(x.name, x.profit if metric == "profit" else x.revenue) for x in profit_by_entity(rows)]
 
 
-def build_server(api: Source) -> FastMCP:
+def build_server(api: Source, history: HistoryStore | None = None) -> FastMCP:
+    """Register every read-only MoySklad tool, grouped by domain. History-powered
+    tools are added only when a snapshot store is wired."""
     mcp = FastMCP("moysklad-mcp")
+    _register_reports(mcp, api)
+    _register_analytics(mcp, api)
+    _register_catalog(mcp, api)
+    if history is not None:
+        _register_history_tools(mcp, api, history)
+    return mcp
 
+
+def _register_reports(mcp: FastMCP, api: Source) -> None:
     # ---- products ---------------------------------------------------------
 
     @mcp.tool()
@@ -156,7 +177,7 @@ def build_server(api: Source) -> FastMCP:
     ) -> dict[str, Any]:
         """Quick business summary for a window: sales, orders, money in/out/balance,
         with the change vs the previous comparable period. Base currency."""
-        return as_object(aggregate.dashboard(period, await api.get_dashboard(period)))
+        return as_object(await usecases.dashboard(api, period))
 
     @mcp.tool()
     async def get_profit(
@@ -234,8 +255,8 @@ def build_server(api: Source) -> FastMCP:
         """Cash flow over a period: money in, out, net, and a time series. Base currency."""
         return as_object(aggregate.money(await api.get_money_series(date_from, date_to, interval)))
 
-    # ---- analytics --------------------------------------------------------
 
+def _register_analytics(mcp: FastMCP, api: Source) -> None:
     @mcp.tool()
     async def compare_periods(
         period_a_from: Annotated[str, Field(description="Baseline start YYYY-MM-DD.")],
@@ -269,6 +290,25 @@ def build_server(api: Source) -> FastMCP:
                 _product_pairs(a_p, metric), _product_pairs(b_p, metric), top_n
             )
         return as_object(cmp)
+
+    @mcp.tool()
+    async def explain_profit_change(
+        period_a_from: Annotated[str, Field(description="Baseline start YYYY-MM-DD.")],
+        period_a_to: Annotated[str, Field(description="Baseline end YYYY-MM-DD.")],
+        period_b_from: Annotated[str, Field(description="Comparison start YYYY-MM-DD.")],
+        period_b_to: Annotated[str, Field(description="Comparison end YYYY-MM-DD.")],
+        top_n: Annotated[int, Field(description="Top product drivers to return. Default 10.")] = 10,
+    ) -> dict[str, Any]:
+        """Explain WHY gross profit changed between two periods: decompose the delta
+        into price, volume, mix and cost effects (plus new/discontinued products), and
+        list the products driving it. Effects reconcile to the total delta to the cent.
+        Gross profit is revenue − cost per product. Base currency."""
+        if top_n <= 0:
+            top_n = 10
+        bridge = await usecases.profit_bridge(
+            api, period_a_from, period_a_to, period_b_from, period_b_to, top_n
+        )
+        return as_object(bridge)
 
     @mcp.tool()
     async def abc_analysis(
@@ -344,13 +384,10 @@ def build_server(api: Source) -> FastMCP:
     ) -> dict[str, Any]:
         """Accounts-receivable aging from customer invoices: total outstanding/overdue
         and buckets (current, 1-30, 31-60, 61-90, 90+). Base currency."""
-        docs = await api.search_documents(
-            DocumentType.INVOICE_OUT, DocumentQuery(expand=["agent"], order="moment,desc")
-        )
-        return as_object(aggregate.receivables_aging(docs, now(), clamp_limit(limit)))
+        return as_object(await usecases.receivables(api, now(), clamp_limit(limit)))
 
-    # ---- documents & counterparties --------------------------------------
 
+def _register_catalog(mcp: FastMCP, api: Source) -> None:
     @mcp.tool()
     async def search_documents(
         type: DocTypeArg,
@@ -535,4 +572,87 @@ def build_server(api: Source) -> FastMCP:
             "code": cur.code,
         }
 
-    return mcp
+
+def _register_history_tools(mcp: FastMCP, api: Source, history: HistoryStore) -> None:
+    """Register tools that read the local snapshot history (XYZ, ABC/XYZ)."""
+
+    @mcp.tool()
+    async def xyz_analysis(
+        min_days: Annotated[
+            int, Field(description="Min days of history to classify. Default 3.")
+        ] = 3,
+        x_threshold: Annotated[float, Field(description="CV ≤ this ⇒ X (stable).")] = 0.10,
+        y_threshold: Annotated[float, Field(description="CV ≤ this ⇒ Y (variable).")] = 0.25,
+        since: Annotated[str, Field(description="Only history since this date YYYY-MM-DD.")] = "",
+        limit: Annotated[int, Field(description="Max detail rows. Default 100.")] = 100,
+    ) -> dict[str, Any]:
+        """XYZ analysis of demand predictability from local snapshot history: the
+        coefficient of variation (σ/μ) of each product's daily sales. X = stable,
+        Y = variable, Z = erratic. Needs accumulated history; `unclassified` counts
+        products with too few days yet."""
+        report = await usecases.xyz(
+            history,
+            since=ensure_ymd(since, "since") or None,
+            min_days=max(1, min_days),
+            x_threshold=x_threshold,
+            y_threshold=y_threshold,
+            limit=clamp_limit(limit),
+        )
+        return as_object(report)
+
+    @mcp.tool()
+    async def abc_xyz_matrix(
+        metric: Annotated[
+            Literal["revenue", "profit"], Field(description="ABC metric. Default revenue.")
+        ] = "revenue",
+        date_from: Annotated[str, Field(description="ABC period start YYYY-MM-DD.")] = "",
+        date_to: Annotated[str, Field(description="ABC period end YYYY-MM-DD.")] = "",
+        min_days: Annotated[int, Field(description="Min days of history for XYZ. Default 3.")] = 3,
+        limit: Annotated[int, Field(description="Max detail rows. Default 200.")] = 200,
+    ) -> dict[str, Any]:
+        """ABC/XYZ matrix: cross value (ABC over a period) with demand predictability
+        (XYZ over snapshot history). Returns 3×3 cells with counts, revenue and a
+        stock recommendation (AX = hold always … CZ = candidate to drop), plus
+        `abcOnly` for products lacking history."""
+        matrix = await usecases.abc_xyz(
+            api,
+            history,
+            metric=metric,
+            date_from=ensure_ymd(date_from, "date_from"),
+            date_to=ensure_ymd(date_to, "date_to"),
+            min_days=max(1, min_days),
+            limit=clamp_limit(limit),
+        )
+        return as_object(matrix)
+
+    @mcp.tool()
+    async def purchase_plan(
+        lead_time_days: Annotated[
+            float, Field(description="Supplier lead time in days. Default 7.")
+        ] = 7.0,
+        service_level: Annotated[
+            float, Field(description="Target no-stockout probability 0.5–0.999. Default 0.95.")
+        ] = 0.95,
+        review_period_days: Annotated[
+            float, Field(description="Days of extra cover to order up to. Default 7.")
+        ] = 7.0,
+        fallback_cv: Annotated[
+            float, Field(description="Assumed demand CV when history is thin. Default 0.6.")
+        ] = 0.6,
+        limit: Annotated[int, Field(description="Max detail rows. Default 100.")] = 100,
+    ) -> dict[str, Any]:
+        """What to order now and days of cover left, per product. Safety stock =
+        z(service_level)·σ·√lead; reorder when available (stock − reserve + in-transit)
+        falls below the reorder point. Demand comes from snapshot history where
+        available (source=history) else a recent-sales estimate (source=estimate)."""
+        report = await usecases.purchase(
+            api,
+            history,
+            now(),
+            lead_time_days=lead_time_days,
+            service_level=service_level,
+            review_period_days=review_period_days,
+            fallback_cv=fallback_cv,
+            limit=clamp_limit(limit),
+        )
+        return as_object(report)

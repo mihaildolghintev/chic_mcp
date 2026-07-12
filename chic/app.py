@@ -26,9 +26,13 @@ from chic.agent import ChicAgent
 from chic.buildinfo import APP_VERSION, build_info
 from chic.cache import CacheStore, CachingClient, Source
 from chic.config import Settings, get_settings
+from chic.history import HistoryStore
+from chic.jobs import JobContext, set_context, set_currency
+from chic.jobs.schedule import SCHEDULE, TIMEZONE
 from chic.logging import setup_logging
 from chic.mcpserver import build_server
 from chic.moysklad import MoyskladClient
+from chic.scheduler import Scheduler
 from chic.store import Store
 from chic.telegram import ChicBot
 from chic.tracing import PhoenixAnnotator, configure_tracing
@@ -45,10 +49,12 @@ async def _resolve_currency(api: Source) -> tuple[str, str]:
     return cur.iso_code, cur.name
 
 
-async def _build_agent(settings: Settings, store: Store, api: Source) -> ChicAgent:
+async def _build_agent(
+    settings: Settings, store: Store, api: Source, history: HistoryStore | None
+) -> ChicAgent:
     # Built with neutral currency; resolved in the background after startup.
     return await ChicAgent.create(
-        fastmcp=build_server(api),
+        fastmcp=build_server(api, history),
         store=store,
         deepseek_api_key=settings.deepseek_api_key,
         deepseek_model=settings.deepseek_model,
@@ -84,11 +90,17 @@ def _make_bot(settings: Settings, agent: ChicAgent) -> ChicBot:
     )
 
 
-async def _startup_network(settings: Settings, agent: ChicAgent, bot: ChicBot, api: Source) -> None:
+async def _startup_network(
+    settings: Settings,
+    agent: ChicAgent,
+    bot: ChicBot,
+    api: Source,
+) -> None:
     """Best-effort, off the critical path: currency labels + webhook registration."""
     code, name = await _resolve_currency(api)
     if code:
         agent.set_currency(code, name)
+        set_currency(code)  # scheduled digest formats money in the account currency
     try:
         url = settings.public_base_url.rstrip("/") + "/tg/" + settings.telegram_webhook_secret
         await bot.register_webhook(url)
@@ -117,12 +129,35 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         cache_store.start_janitor(600)
         api = CachingClient(ms_client, cache_store)
 
-    agent = await _build_agent(settings, store, api)
+    # Snapshot history (optional): accumulates the local time series XYZ/forecast need,
+    # and powers the history-only MCP tools, so it must exist before the agent is built.
+    history: HistoryStore | None = None
+    if settings.history_db:
+        history = await HistoryStore.open(settings.history_db)
+
+    agent = await _build_agent(settings, store, api, history)
     bot = _make_bot(settings, agent)
     app.state.bot = bot
 
+    # Scheduled jobs (optional): APScheduler with a SQLite job store, firing by cron.
+    # The schedule (chic.jobs.schedule) is the single source of truth for what runs.
+    scheduler: Scheduler | None = None
+    if settings.jobs_db and SCHEDULE:
+        set_context(
+            JobContext(
+                api=api,
+                history=history,
+                notify=bot.send,
+                recipients=tuple(sorted(settings.allowed_ids)),  # stable delivery order
+            )
+        )
+        scheduler = Scheduler(jobs_db=settings.jobs_db, timezone=TIMEZONE)
+        scheduler.register(SCHEDULE)
+
     # Network I/O runs after we yield, so the socket binds and /healthz answers now.
     bg = asyncio.create_task(_startup_network(settings, agent, bot, api))
+    if scheduler is not None:
+        scheduler.start()
 
     try:
         yield
@@ -130,10 +165,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         bg.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await bg
+        if scheduler is not None:
+            scheduler.shutdown()
         await bot.close()
         await ms_client.aclose()
         if cache_store is not None:
             await cache_store.close()
+        if history is not None:
+            await history.close()
         await store.close()
         shutdown_tracing()
 

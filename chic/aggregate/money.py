@@ -1,21 +1,55 @@
-"""Money conversion + rounding, faithfully matching the Go implementation.
+"""Money conversion + rounding.
 
 MoySklad stores every monetary amount in the account currency's minor units
 (1/100 of the major unit). All conversion to major units happens in this layer
 and nowhere else; the layer is currency-agnostic.
 
-CRITICAL PARITY NOTE: Go's ``math.Round`` rounds half **away from zero**, whereas
-Python's built-in ``round`` and numpy/pandas round half **to even** (banker's
-rounding). We reproduce Go's behavior explicitly so cents never diverge — this is
-also why the analytics layer does not lean on pandas' ``.round()``.
+Money is represented as :class:`decimal.Decimal` with ``ROUND_HALF_UP`` (halves
+away from zero). This reproduces the previous ``float`` + Go-``math.Round``
+behaviour exactly while removing binary-float drift that would otherwise
+accumulate through the multiplications/divisions in the forward analytics
+(purchase planning, price/volume/mix bridges). ``Decimal`` values are serialized
+back to JSON numbers at the MCP boundary (see ``Money`` in
+:mod:`chic.aggregate.models`).
+
+Non-money quantities (units, days) and percentages stay ``float`` and keep the
+original half-away rounding via :func:`round2` — they are display values, not
+amounts that feed further money arithmetic.
 """
 
 from __future__ import annotations
 
 import math
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+_CENTS = Decimal("0.01")
+_ONE = Decimal("1")
+
+
+def dec(x: float | int | str | Decimal) -> Decimal:
+    """Coerce to ``Decimal`` via ``str`` so a float uses its shortest repr.
+
+    ``Decimal(str(0.1))`` is ``Decimal('0.1')`` (what the source number *meant*),
+    not the exact binary expansion ``Decimal(0.1)`` would give.
+    """
+    return x if isinstance(x, Decimal) else Decimal(str(x))
+
+
+def money_round(v: Decimal) -> Decimal:
+    """Quantize a money amount to 2 decimals, halves away from zero."""
+    return v.quantize(_CENTS, rounding=ROUND_HALF_UP)
+
+
+def minor_to_major(minor: float | Decimal) -> Decimal:
+    """Minor units → major units (Decimal, 2 decimals).
+
+    Fractional minor units (rare, but the API may return them) are rounded to a
+    whole minor unit half-away first, matching the previous ``math.Round`` path.
+    """
+    whole = dec(minor).quantize(_ONE, rounding=ROUND_HALF_UP)
+    return money_round(whole / 100)
 
 
 def round_half_away(x: float) -> float:
@@ -23,23 +57,21 @@ def round_half_away(x: float) -> float:
     return math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5)
 
 
-def minor_to_major(minor: float) -> float:
-    """Minor units → major units, 2 decimals (every MoySklad currency is 1/100)."""
-    return round_half_away(minor) / 100.0
-
-
 def round2(v: float) -> float:
-    """Round to two decimal places, halves away from zero."""
+    """Round a non-money quantity/percentage to two decimals, halves away from zero."""
     return round_half_away(v * 100) / 100.0
 
 
-def margin_pct(profit: float, revenue: float) -> float:
-    if revenue == 0:
+def margin_pct(profit: float | Decimal, revenue: float | Decimal) -> float:
+    r = float(revenue)
+    if r == 0:
         return 0.0
-    return round2(profit / revenue * 100)
+    return round2(float(profit) / r * 100)
 
 
-def pct_change(a: float, b: float) -> float:
+def pct_change(a: float | Decimal, b: float | Decimal) -> float:
+    a = float(a)
+    b = float(b)
     if a == 0:
         return 0.0 if b == 0 else 100.0
     return round2((b - a) / a * 100)

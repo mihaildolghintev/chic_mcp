@@ -7,6 +7,7 @@ returns the uniform truncating envelope: totals over the full set, rows capped.
 
 from __future__ import annotations
 
+from chic.aggregate.envelope import truncate
 from chic.aggregate.models import (
     AssortmentLine,
     AuditLine,
@@ -31,7 +32,7 @@ from chic.aggregate.models import (
     TurnoverLine,
     TurnoverTotals,
 )
-from chic.aggregate.money import margin_pct, minor_to_major, round2
+from chic.aggregate.money import dec, margin_pct, minor_to_major, money_round, round2
 from chic.moysklad.models import (
     AssortmentRow,
     AuditRow,
@@ -50,12 +51,12 @@ from chic.moysklad.models import (
 )
 
 
-def _truncate[Row](rows: list[Row], limit: int) -> tuple[list[Row], int, bool]:
-    """Cap rows to a display limit (<=0 ⇒ all); report whether truncation happened."""
-    full = len(rows)
-    if 0 < limit < full:
-        return rows[:limit], full, True
-    return rows, full, False
+def product_key(meta_href: str, name: str) -> str:
+    """Stable per-product join key, shared by the live reports and the snapshot
+    history so their keys always match. Falls back to the name when the API omits
+    the href (an empty href would otherwise collapse distinct products into one).
+    """
+    return meta_href or f"name:{name}"
 
 
 # ---- dashboard ------------------------------------------------------------
@@ -85,8 +86,8 @@ def product(p: Product) -> ProductSummary:
         code=p.code,
         article=p.article,
         archived=p.archived,
-        sale_price=minor_to_major(p.sale_prices[0].value) if p.sale_prices else 0.0,
-        buy_price=minor_to_major(p.buy_price.value) if p.buy_price is not None else 0.0,
+        sale_price=minor_to_major(p.sale_prices[0].value) if p.sale_prices else dec(0),
+        buy_price=minor_to_major(p.buy_price.value) if p.buy_price is not None else dec(0),
     )
 
 
@@ -104,6 +105,7 @@ def profit_by_product(rows: list[ProfitByProductRow]) -> list[ProfitProductLine]
         profit = minor_to_major(r.profit)
         out.append(
             ProfitProductLine(
+                id=product_key(r.assortment.meta.href, r.assortment.name),
                 name=r.assortment.name,
                 code=r.assortment.code,
                 sell_quantity=r.sell_quantity,
@@ -140,17 +142,17 @@ def profit_product_report(
     rows: list[ProfitByProductRow], limit: int
 ) -> Report[ProfitProductLine, ProfitTotals]:
     lines = sorted(profit_by_product(rows), key=lambda x: x.revenue, reverse=True)
-    revenue = sum(x.revenue for x in lines)
-    profit = sum(x.profit for x in lines)
+    revenue = sum((x.revenue for x in lines), dec(0))
+    profit = sum((x.profit for x in lines), dec(0))
     totals = ProfitTotals(
-        revenue=round2(revenue),
-        cost=round2(sum(x.cost for x in lines)),
-        profit=round2(profit),
-        return_sum=round2(sum(x.return_sum for x in lines)),
+        revenue=money_round(revenue),
+        cost=money_round(sum((x.cost for x in lines), dec(0))),
+        profit=money_round(profit),
+        return_sum=money_round(sum((x.return_sum for x in lines), dec(0))),
         sell_quantity=round2(sum(x.sell_quantity for x in lines)),
-        margin_pct=margin_pct(round2(profit), round2(revenue)),
+        margin_pct=margin_pct(profit, revenue),
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[ProfitProductLine, ProfitTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -160,16 +162,16 @@ def profit_entity_report(
     rows: list[ProfitByEntityRow], limit: int
 ) -> Report[ProfitEntityLine, ProfitTotals]:
     lines = sorted(profit_by_entity(rows), key=lambda x: x.revenue, reverse=True)
-    revenue = sum(x.revenue for x in lines)
-    profit = sum(x.profit for x in lines)
+    revenue = sum((x.revenue for x in lines), dec(0))
+    profit = sum((x.profit for x in lines), dec(0))
     totals = ProfitTotals(
-        revenue=round2(revenue),
-        cost=round2(sum(x.cost for x in lines)),
-        profit=round2(profit),
+        revenue=money_round(revenue),
+        cost=money_round(sum((x.cost for x in lines), dec(0))),
+        profit=money_round(profit),
         sales_count=sum(x.sales_count for x in lines),
-        margin_pct=margin_pct(round2(profit), round2(revenue)),
+        margin_pct=margin_pct(profit, revenue),
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[ProfitEntityLine, ProfitTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -211,9 +213,9 @@ def turnover_report(
     totals = TurnoverTotals(
         income_qty=round2(sum(x.income_qty for x in lines)),
         outcome_qty=round2(sum(x.outcome_qty for x in lines)),
-        end_value=round2(sum(x.end_value for x in lines)),
+        end_value=money_round(sum((x.end_value for x in lines), dec(0))),
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[TurnoverLine, TurnoverTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -228,6 +230,7 @@ def stock(rows: list[StockRow]) -> list[StockLine]:
         cost = minor_to_major(r.price)
         out.append(
             StockLine(
+                id=product_key(r.meta.href, r.name),
                 name=r.name,
                 code=r.code,
                 article=r.article,
@@ -237,7 +240,7 @@ def stock(rows: list[StockRow]) -> list[StockLine]:
                 in_transit=r.in_transit,
                 cost_price=cost,
                 sale_price=minor_to_major(r.sale_price),
-                stock_value=round2(r.stock * cost),
+                stock_value=money_round(dec(r.stock) * cost),
                 stock_days=int(r.stock_days),
             )
         )
@@ -249,9 +252,9 @@ def stock_report(rows: list[StockRow], limit: int) -> Report[StockLine, StockTot
     totals = StockTotals(
         units=round2(sum(x.stock for x in lines)),
         available=round2(sum(x.available for x in lines)),
-        stock_value=round2(sum(x.stock_value for x in lines)),
+        stock_value=money_round(sum((x.stock_value for x in lines), dec(0))),
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[StockLine, StockTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -281,16 +284,16 @@ def counterparty_report(
     rows: list[CounterpartyRow], limit: int
 ) -> Report[CounterpartyMetric, CounterpartyTotals]:
     lines = sorted(counterparty_metrics(rows), key=lambda x: x.revenue, reverse=True)
-    revenue = sum(x.revenue for x in lines)
-    profit = sum(x.profit for x in lines)
+    revenue = sum((x.revenue for x in lines), dec(0))
+    profit = sum((x.profit for x in lines), dec(0))
     totals = CounterpartyTotals(
-        revenue=round2(revenue),
-        profit=round2(profit),
-        returns_sum=round2(sum(x.returns_sum for x in lines)),
-        balance=round2(sum(x.balance for x in lines)),
-        margin_pct=margin_pct(round2(profit), round2(revenue)),
+        revenue=money_round(revenue),
+        profit=money_round(profit),
+        returns_sum=money_round(sum((x.returns_sum for x in lines), dec(0))),
+        balance=money_round(sum((x.balance for x in lines), dec(0))),
+        margin_pct=margin_pct(profit, revenue),
     )
-    shown, full, truncated = _truncate(lines, limit)
+    shown, full, truncated = truncate(lines, limit)
     return Report[CounterpartyMetric, CounterpartyTotals](
         totals=totals, row_count=full, returned=len(shown), truncated=truncated, rows=shown
     )
@@ -305,7 +308,7 @@ def money(m: MoneySeries) -> MoneyFlow:
     return MoneyFlow(
         income=income,
         outcome=outcome,
-        net=round2(income - outcome),
+        net=money_round(income - outcome),
         series=[
             MoneyFlowPoint(
                 date=p.date,
@@ -358,8 +361,8 @@ def assortment(rows: list[AssortmentRow]) -> list[AssortmentLine]:
             name=r.name,
             code=r.code,
             article=r.article,
-            sale_price=minor_to_major(r.sale_prices[0].value) if r.sale_prices else 0.0,
-            buy_price=minor_to_major(r.buy_price.value) if r.buy_price is not None else 0.0,
+            sale_price=minor_to_major(r.sale_prices[0].value) if r.sale_prices else dec(0),
+            buy_price=minor_to_major(r.buy_price.value) if r.buy_price is not None else dec(0),
             stock=r.quantity,
         )
         for r in rows
@@ -416,7 +419,7 @@ def sales_series(kind: str, s: SalesSeries) -> SalesSeriesOut:
     return SalesSeriesOut(
         kind=kind,
         total_quantity=round2(sum(p.quantity for p in points)),
-        total_sum=round2(sum(p.sum for p in points)),
+        total_sum=money_round(sum((p.sum for p in points), dec(0))),
         series=points,
     )
 

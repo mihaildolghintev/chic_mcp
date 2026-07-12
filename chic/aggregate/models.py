@@ -8,10 +8,17 @@ explicit alias is ``class`` (a Python keyword). Serialize with
 
 from __future__ import annotations
 
-from typing import Any
+from decimal import Decimal
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 from pydantic.alias_generators import to_camel
+
+# A money amount. Stored as Decimal (exact, half-away arithmetic) but emitted as a
+# JSON number so the wire shape stays numeric for the LLM and the golden fixtures.
+Money = Annotated[
+    Decimal, PlainSerializer(lambda d: float(d), return_type=float, when_used="always")
+]
 
 
 class OutModel(BaseModel):
@@ -37,44 +44,45 @@ class Report[Row, Totals](OutModel):
 class DashboardSummary(OutModel):
     period: str
     sales_count: int
-    sales_amount: float
-    sales_delta_vs_prev: float
+    sales_amount: Money
+    sales_delta_vs_prev: Money
     orders_count: int
-    orders_amount: float
-    money_income: float
-    money_outcome: float
-    money_balance: float
+    orders_amount: Money
+    money_income: Money
+    money_outcome: Money
+    money_balance: Money
 
 
 # ---- profit ---------------------------------------------------------------
 
 
 class ProfitProductLine(OutModel):
+    id: str = ""  # product href — the stable join key (name can collide/change)
     name: str
     code: str = ""
     sell_quantity: float
-    revenue: float
-    cost: float
-    return_sum: float
-    profit: float
+    revenue: Money
+    cost: Money
+    return_sum: Money
+    profit: Money
     margin_pct: float
 
 
 class ProfitEntityLine(OutModel):
     name: str
-    revenue: float
-    cost: float
-    profit: float
+    revenue: Money
+    cost: Money
+    profit: Money
     sales_count: int
-    avg_check: float
+    avg_check: Money
     margin_pct: float
 
 
 class ProfitTotals(OutModel):
-    revenue: float
-    cost: float
-    profit: float
-    return_sum: float = 0.0
+    revenue: Money
+    cost: Money
+    profit: Money
+    return_sum: Money = Decimal(0)
     sell_quantity: float = 0.0
     sales_count: int = 0
     margin_pct: float = 0.0
@@ -89,20 +97,21 @@ class TurnoverLine(OutModel):
     income_qty: float
     outcome_qty: float
     end_qty: float
-    end_value: float
+    end_value: Money
     turnover_days: float
 
 
 class TurnoverTotals(OutModel):
     income_qty: float
     outcome_qty: float
-    end_value: float
+    end_value: Money
 
 
 # ---- stock ----------------------------------------------------------------
 
 
 class StockLine(OutModel):
+    id: str = ""  # product href — the stable join key (name can collide/change)
     name: str
     code: str = ""
     article: str = ""
@@ -110,16 +119,16 @@ class StockLine(OutModel):
     reserve: float
     available: float
     in_transit: float
-    cost_price: float
-    sale_price: float
-    stock_value: float
+    cost_price: Money
+    sale_price: Money
+    stock_value: Money
     stock_days: int
 
 
 class StockTotals(OutModel):
     units: float
     available: float
-    stock_value: float
+    stock_value: Money
 
 
 # ---- counterparty report --------------------------------------------------
@@ -130,18 +139,18 @@ class CounterpartyMetric(OutModel):
     first_demand: str = ""
     last_demand: str = ""
     demands_count: int
-    revenue: float
-    avg_receipt: float
-    returns_sum: float
-    balance: float
-    profit: float
+    revenue: Money
+    avg_receipt: Money
+    returns_sum: Money
+    balance: Money
+    profit: Money
 
 
 class CounterpartyTotals(OutModel):
-    revenue: float
-    profit: float
-    returns_sum: float = 0.0
-    balance: float
+    revenue: Money
+    profit: Money
+    returns_sum: Money = Decimal(0)
+    balance: Money
     margin_pct: float
 
 
@@ -150,15 +159,15 @@ class CounterpartyTotals(OutModel):
 
 class MoneyFlowPoint(OutModel):
     date: str
-    income: float
-    outcome: float
-    balance: float
+    income: Money
+    outcome: Money
+    balance: Money
 
 
 class MoneyFlow(OutModel):
-    income: float
-    outcome: float
-    net: float
+    income: Money
+    outcome: Money
+    net: Money
     series: list[MoneyFlowPoint]
 
 
@@ -169,8 +178,8 @@ class DocumentSummary(OutModel):
     id: str
     name: str
     moment: str
-    sum: float
-    paid: float = 0.0
+    sum: Money
+    paid: Money = Decimal(0)
     counterparty: str = ""
     state: str = ""
     store: str = ""
@@ -183,23 +192,23 @@ class PositionRow(OutModel):
     name: str
     code: str = ""
     quantity: float
-    price: float
+    price: Money
     discount: float = 0.0
     vat: int = 0
-    total: float
+    total: Money
 
 
 class DocumentDetail(DocumentSummary):
     description: str = ""
-    vat_sum: float = 0.0
+    vat_sum: Money = Decimal(0)
     payment_due_date: str = ""
     positions: list[PositionRow] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
 class DocumentTotals(OutModel):
-    sum: float
-    paid: float
+    sum: Money
+    paid: Money
 
 
 # ---- reference dictionaries -----------------------------------------------
@@ -231,8 +240,8 @@ class AssortmentLine(OutModel):
     name: str
     code: str = ""
     article: str = ""
-    sale_price: float = 0.0
-    buy_price: float = 0.0
+    sale_price: Money = Decimal(0)
+    buy_price: Money = Decimal(0)
     stock: float = 0.0
 
 
@@ -260,13 +269,13 @@ class StoreStockTotals(OutModel):
 class SalesSeriesPointOut(OutModel):
     date: str
     quantity: float
-    sum: float
+    sum: Money
 
 
 class SalesSeriesOut(OutModel):
     kind: str  # sales | orders
     total_quantity: float
-    total_sum: float
+    total_sum: Money
     series: list[SalesSeriesPointOut] = Field(default_factory=list)
 
 
@@ -291,8 +300,8 @@ class ProductSummary(OutModel):
     code: str = ""
     article: str = ""
     archived: bool
-    sale_price: float
-    buy_price: float
+    sale_price: Money
+    buy_price: Money
 
 
 # ---- ABC ------------------------------------------------------------------
@@ -300,7 +309,7 @@ class ProductSummary(OutModel):
 
 class ABCItem(OutModel):
     name: str
-    value: float
+    value: Money
     share: float = 0.0
     cumulative_share: float = 0.0
     abc_class: str = Field(default="C", alias="class")
@@ -308,7 +317,7 @@ class ABCItem(OutModel):
 
 class ABCTotals(OutModel):
     count: int
-    value: float
+    value: Money
     a_count: int
     b_count: int
     c_count: int
@@ -320,10 +329,10 @@ class ABCTotals(OutModel):
 class CounterpartySegment(OutModel):
     name: str
     segments: list[str] = Field(default_factory=list)
-    revenue: float
-    avg_receipt: float
-    profit: float
-    balance: float
+    revenue: Money
+    avg_receipt: Money
+    profit: Money
+    balance: Money
     days_since_last_purchase: int
 
 
@@ -346,7 +355,7 @@ class DeadStockLine(StockLine):
 
 class DeadStockTotals(OutModel):
     count: int
-    stock_value: float
+    stock_value: Money
 
 
 # ---- period comparison ----------------------------------------------------
@@ -354,19 +363,145 @@ class DeadStockTotals(OutModel):
 
 class Change(OutModel):
     key: str
-    value_a: float
-    value_b: float
-    delta: float
+    value_a: Money
+    value_b: Money
+    delta: Money
     delta_pct: float
 
 
 class Comparison(OutModel):
-    total_a: float
-    total_b: float
-    delta: float
+    total_a: Money
+    total_b: Money
+    delta: Money
     delta_pct: float
     top_gainers: list[Change]
     top_decliners: list[Change]
+
+
+# ---- profit bridge (price / volume / mix / cost decomposition) -------------
+
+
+class BridgeDriver(OutModel):
+    """One product's contribution to the gross-profit change between two periods.
+
+    For products present in both periods (``kind == "common"``) the three effects
+    sum exactly to ``delta``. For ``new`` / ``discontinued`` products the effects
+    are zero and the whole ``delta`` sits in the corresponding aggregate bucket.
+    """
+
+    name: str
+    kind: str  # common | new | discontinued
+    qty_a: float
+    qty_b: float
+    profit_a: Money
+    profit_b: Money
+    delta: Money
+    price_effect: Money
+    cost_effect: Money
+    qty_effect: Money  # volume + mix, at product level
+
+
+class ProfitBridge(OutModel):
+    """Gross-profit change decomposed into price, volume, mix and cost effects.
+
+    Gross profit is ``revenue - cost`` per product, so the six effects plus the
+    ``rounding`` residual reconcile to ``delta`` to the cent. ``price``/``cost``/
+    ``volume``/``mix`` cover products sold in both periods; products that appeared
+    or disappeared are attributed to ``new_products`` / ``discontinued``.
+    """
+
+    profit_a: Money
+    profit_b: Money
+    delta: Money
+    price_effect: Money
+    cost_effect: Money
+    volume_effect: Money
+    mix_effect: Money
+    new_products_effect: Money
+    discontinued_effect: Money
+    rounding: Money  # residual so the rounded effects sum back to delta exactly
+    common_count: int
+    new_count: int
+    discontinued_count: int
+    top_drivers: list[BridgeDriver]
+
+
+# ---- XYZ (demand variability, over snapshot history) ----------------------
+
+
+class XYZItem(OutModel):
+    name: str
+    code: str = ""
+    days: int  # observed sales-days used for the statistic
+    mean_demand: float  # average daily units
+    std_demand: float  # population stdev of daily units
+    cv: float  # coefficient of variation σ/μ
+    xyz_class: str = "Z"  # X stable | Y variable | Z erratic (wire: xyzClass)
+
+
+class XYZTotals(OutModel):
+    count: int
+    x_count: int
+    y_count: int
+    z_count: int
+    unclassified: int  # products with too little history to classify
+    # Data-health of the underlying snapshot history, so a caller can tell whether a
+    # classification rests on complete data or a series with outage gaps.
+    history_days: int = 0  # days the snapshot job actually captured
+    history_gap_days: int = 0  # calendar days in the covered span never captured
+    history_gaps: list[str] = Field(default_factory=list)  # first few missing dates
+
+
+# ---- ABC/XYZ matrix -------------------------------------------------------
+
+
+class ABCXYZCell(OutModel):
+    cell: str  # e.g. "AX"
+    count: int
+    revenue: Money  # total revenue of the products in this cell (period ABC input)
+    recommendation: str
+
+
+class ABCXYZItem(OutModel):
+    name: str
+    code: str = ""
+    abc_class: str  # wire: abcClass
+    xyz_class: str  # wire: xyzClass
+    cell: str
+    revenue: Money
+    cv: float
+
+
+class ABCXYZMatrix(OutModel):
+    classified: int
+    abc_only: int  # products with ABC (revenue) but no XYZ history
+    cells: list[ABCXYZCell]
+    items: list[ABCXYZItem]
+    item_count: int
+    items_truncated: bool = False
+
+
+# ---- purchase plan (reorder forecast) -------------------------------------
+
+
+class PurchasePlanItem(OutModel):
+    name: str
+    code: str = ""
+    available: float  # on hand − reserved + in transit
+    daily_demand: float  # forecast mean daily units
+    demand_std: float  # daily demand stdev
+    source: str  # history | estimate | none — where the demand forecast came from
+    days_of_cover: float  # available ÷ daily demand; -1 when there is no demand
+    safety_stock: float
+    reorder_point: float
+    to_order: int  # units to order now (0 unless below the reorder point)
+    order_value: Money  # to_order × cost price
+
+
+class PurchasePlanTotals(OutModel):
+    count: int
+    need_order: int  # products with to_order > 0
+    order_value: Money
 
 
 # ---- receivables aging ----------------------------------------------------
@@ -376,19 +511,19 @@ class AgingItem(OutModel):
     document: str
     counterparty: str = ""
     due_date: str = ""
-    outstanding: float
+    outstanding: Money
     days_overdue: int
 
 
 class AgingBucket(OutModel):
     label: str
     count: int = 0
-    amount: float = 0.0
+    amount: Money = Decimal(0)
 
 
 class Aging(OutModel):
-    total_outstanding: float
-    total_overdue: float
+    total_outstanding: Money
+    total_overdue: Money
     buckets: list[AgingBucket]
     item_count: int
     items_truncated: bool = False

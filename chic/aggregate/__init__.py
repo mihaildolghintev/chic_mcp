@@ -15,13 +15,14 @@ from chic.aggregate.analytics import (
     segment_counterparties,
     segment_report,
 )
+from chic.aggregate.bridge import profit_bridge
 from chic.aggregate.document import (
     document_detail_of,
     document_report,
     document_summaries,
     document_summary_of,
 )
-from chic.aggregate.money import minor_to_major, round2
+from chic.aggregate.money import dec, minor_to_major, money_round, round2
 from chic.aggregate.report import (
     assortment,
     audit,
@@ -50,6 +51,7 @@ __all__ = [
     "dashboard",
     "dead_stock",
     "dead_stock_report",
+    "dec",
     "document_detail_of",
     "document_report",
     "document_summaries",
@@ -57,7 +59,9 @@ __all__ = [
     "entity_refs",
     "minor_to_major",
     "money",
+    "money_round",
     "products",
+    "profit_bridge",
     "profit_entity_report",
     "profit_product_report",
     "receivables_aging",
