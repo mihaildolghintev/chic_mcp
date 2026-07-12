@@ -46,7 +46,9 @@ def test_index_from_callback() -> None:
 
 
 def test_template_by_callback() -> None:
-    assert template_by_callback("ask:0").startswith("Прибыльность за последние 7 дней")
+    question = template_by_callback("ask:0")
+    assert question is not None
+    assert question.startswith("Прибыльность за последние 7 дней")
     assert template_by_callback("ask:999") is None
 
 
