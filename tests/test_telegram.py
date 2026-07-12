@@ -46,13 +46,19 @@ def test_index_from_callback() -> None:
 
 
 def test_template_by_callback() -> None:
-    assert template_by_callback("ask:0") == "Покажи продажи за сегодня"
+    question = template_by_callback("ask:0")
+    assert question is not None
+    assert question.startswith("Прибыльность за последние 7 дней")
     assert template_by_callback("ask:999") is None
 
 
-def test_menu_keyboard_one_button_per_template() -> None:
+def test_menu_keyboard_two_buttons_per_row() -> None:
+    from chic.telegram.keyboards import QUESTION_TEMPLATES
+
     kb = menu_keyboard()
-    assert len(kb.inline_keyboard) == 6
+    flat = [btn for row in kb.inline_keyboard for btn in row]
+    assert len(flat) == len(QUESTION_TEMPLATES)
+    assert all(len(row) <= 2 for row in kb.inline_keyboard)
     assert kb.inline_keyboard[0][0].callback_data == "ask:0"
 
 
