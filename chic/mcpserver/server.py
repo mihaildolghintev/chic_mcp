@@ -255,6 +255,7 @@ def _register_reports(mcp: FastMCP, api: Source) -> None:
         """Cash flow over a period: money in, out, net, and a time series. Base currency."""
         return as_object(aggregate.money(await api.get_money_series(date_from, date_to, interval)))
 
+
 def _register_analytics(mcp: FastMCP, api: Source) -> None:
     @mcp.tool()
     async def compare_periods(
@@ -384,6 +385,7 @@ def _register_analytics(mcp: FastMCP, api: Source) -> None:
         """Accounts-receivable aging from customer invoices: total outstanding/overdue
         and buckets (current, 1-30, 31-60, 61-90, 90+). Base currency."""
         return as_object(await usecases.receivables(api, now(), clamp_limit(limit)))
+
 
 def _register_catalog(mcp: FastMCP, api: Source) -> None:
     @mcp.tool()
@@ -570,6 +572,7 @@ def _register_catalog(mcp: FastMCP, api: Source) -> None:
             "code": cur.code,
         }
 
+
 def _register_history_tools(mcp: FastMCP, api: Source, history: HistoryStore) -> None:
     """Register tools that read the local snapshot history (XYZ, ABC/XYZ)."""
 
@@ -604,9 +607,7 @@ def _register_history_tools(mcp: FastMCP, api: Source, history: HistoryStore) ->
         ] = "revenue",
         date_from: Annotated[str, Field(description="ABC period start YYYY-MM-DD.")] = "",
         date_to: Annotated[str, Field(description="ABC period end YYYY-MM-DD.")] = "",
-        min_days: Annotated[
-            int, Field(description="Min days of history for XYZ. Default 3.")
-        ] = 3,
+        min_days: Annotated[int, Field(description="Min days of history for XYZ. Default 3.")] = 3,
         limit: Annotated[int, Field(description="Max detail rows. Default 200.")] = 200,
     ) -> dict[str, Any]:
         """ABC/XYZ matrix: cross value (ABC over a period) with demand predictability

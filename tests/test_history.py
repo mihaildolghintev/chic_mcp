@@ -238,5 +238,3 @@ async def test_history_tools_absent_without_history() -> None:
     names = {t.name for t in await server.list_tools()}
     assert "xyz_analysis" not in names  # no history store ⇒ not registered
     assert len(names) == 23
-
-

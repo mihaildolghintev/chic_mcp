@@ -134,9 +134,11 @@ class HistoryStore:
             return (await conn.execute(stmt)).scalar_one_or_none()
 
     async def has_stock(self, date: str) -> bool:
-        stmt = select(StockSnapshotRow.product_href).where(
-            StockSnapshotRow.snapshot_date == date
-        ).limit(1)
+        stmt = (
+            select(StockSnapshotRow.product_href)
+            .where(StockSnapshotRow.snapshot_date == date)
+            .limit(1)
+        )
         async with self._reader.connect() as conn:
             return (await conn.execute(stmt)).first() is not None
 
