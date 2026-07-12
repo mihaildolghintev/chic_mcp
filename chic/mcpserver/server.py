@@ -33,18 +33,89 @@ DocTypeArg = Literal[
     "customerorder",
     "supply",
     "purchaseorder",
+    "internalorder",
     "invoiceout",
     "invoicein",
     "salesreturn",
     "purchasereturn",
     "paymentin",
     "paymentout",
+    "cashin",
+    "cashout",
+    "commissionreportin",
+    "commissionreportout",
+    "factureout",
+    "facturein",
+    "counterpartyadjustment",
+    "prepayment",
+    "prepaymentreturn",
+    "retaildemand",
+    "retailsalesreturn",
+    "retailshift",
+    "retaildrawercashin",
+    "retaildrawercashout",
     "move",
     "inventory",
     "loss",
     "enter",
     "processing",
 ]
+
+# Document types that own a status workflow (states via metadata). Used by both
+# search_documents (state filter) and list_document_states.
+StatefulDocTypeArg = Literal[
+    "demand",
+    "customerorder",
+    "supply",
+    "purchaseorder",
+    "internalorder",
+    "invoiceout",
+    "invoicein",
+    "salesreturn",
+    "purchasereturn",
+    "paymentin",
+    "paymentout",
+    "cashin",
+    "cashout",
+    "commissionreportin",
+    "commissionreportout",
+    "counterpartyadjustment",
+    "retaildemand",
+    "move",
+    "inventory",
+    "loss",
+    "enter",
+    "processing",
+]
+
+ReferenceKindArg = Literal[
+    "store",
+    "organization",
+    "saleschannel",
+    "employee",
+    "project",
+    "expenseitem",
+    "productfolder",
+    "contract",
+    "group",
+    "country",
+    "uom",
+]
+
+# Reference dictionaries that carry an ``archived`` flag. The rest (country, uom,
+# group) have no such attribute, and filtering by an unknown field is a hard 400.
+_ARCHIVABLE_REFERENCES: frozenset[str] = frozenset(
+    {
+        "store",
+        "organization",
+        "saleschannel",
+        "employee",
+        "project",
+        "expenseitem",
+        "productfolder",
+        "contract",
+    }
+)
 
 
 def _product_pairs(rows: list[ProfitByProductRow], metric: str) -> list[tuple[str, float]]:
@@ -286,15 +357,25 @@ def build_server(api: Source) -> FastMCP:
         date_from: Annotated[str, Field(description="moment >= YYYY-MM-DD.")] = "",
         date_to: Annotated[str, Field(description="moment <= YYYY-MM-DD.")] = "",
         counterparty_id: Annotated[str, Field(description="Filter by counterparty UUID.")] = "",
+        organization_id: Annotated[str, Field(description="Filter by own-company UUID.")] = "",
+        store_id: Annotated[str, Field(description="Filter by warehouse UUID.")] = "",
+        state_id: Annotated[
+            str, Field(description="Filter by document status UUID (see list_document_states).")
+        ] = "",
         search: Annotated[str, Field(description="Free-text over name/description.")] = "",
         limit: Annotated[int, Field(description="Max detail rows. Default 100.")] = 100,
     ) -> dict[str, Any]:
-        """Search documents of a type in a date range. `totals` (sum, paid) cover every
-        match; `rows` are the most recent. Use get_document for line items."""
+        """Search documents of a type in a date range, optionally scoped by counterparty,
+        organization, warehouse or status. `totals` (sum, paid) cover every match; `rows`
+        are the most recent. Covers retail sales, cash orders, commission reports, etc.
+        Use get_document for line items."""
         query = DocumentQuery(
             from_=date_from,
             to=date_to,
             counterparty_id=counterparty_id,
+            organization_id=organization_id,
+            store_id=store_id,
+            state_id=state_id,
             search=search,
             order="moment,desc",
         )
@@ -327,6 +408,120 @@ def build_server(api: Source) -> FastMCP:
             ListOptions(search=query, limit=clamp_limit(limit), order="name,asc")
         )
         return as_object(rows)
+
+    # ---- reference dictionaries & catalog --------------------------------
+
+    @mcp.tool()
+    async def list_references(
+        kind: Annotated[
+            ReferenceKindArg,
+            Field(
+                description="Which dictionary: store, organization, saleschannel, employee, "
+                "project, expenseitem, productfolder, contract, group, country, uom."
+            ),
+        ],
+        query: Annotated[str, Field(description="Full-text search over the dictionary.")] = "",
+        include_archived: Annotated[bool, Field(description="Include archived rows.")] = False,
+        limit: Annotated[int, Field(description="Max rows. Default 200.")] = 200,
+    ) -> dict[str, Any]:
+        """List a reference dictionary (id, name, code). Use this to resolve the UUIDs
+        that other tools accept — e.g. a warehouse for get_stock/get_stock_by_store, a
+        sales channel/employee for get_profit, or an organization/store for
+        search_documents and get_sales."""
+        opts = ListOptions(search=query, limit=clamp_limit(limit), order="name,asc")
+        if not include_archived and kind in _ARCHIVABLE_REFERENCES:
+            opts.filter.append("archived=false")
+        return as_object(aggregate.entity_refs(await api.list_entity_refs(kind, opts)))
+
+    @mcp.tool()
+    async def list_document_states(
+        document_type: Annotated[
+            StatefulDocTypeArg, Field(description="Document type whose statuses to list.")
+        ],
+    ) -> dict[str, Any]:
+        """List the status workflow (id, name, type) for a document type. Feed a status
+        id to search_documents(state_id=...) to filter, e.g. orders in a given stage."""
+        return as_object(aggregate.states(await api.list_states(document_type)))
+
+    @mcp.tool()
+    async def search_assortment(
+        query: Annotated[str, Field(description="Full-text over name/code/article.")] = "",
+        include_archived: Annotated[bool, Field(description="Include archived items.")] = False,
+        limit: Annotated[int, Field(description="Max rows. Default 100.")] = 100,
+    ) -> dict[str, Any]:
+        """Unified catalog search across products, variants, bundles and services (with
+        `kind` telling them apart). Broader than list_products, which is products-only."""
+        opts = ListOptions(search=query, limit=clamp_limit(limit), order="name,asc")
+        if not include_archived:
+            opts.filter.append("archived=false")
+        return as_object(aggregate.assortment(await api.search_assortment(opts)))
+
+    # ---- extra reports ----------------------------------------------------
+
+    @mcp.tool()
+    async def get_stock_by_store(
+        stock_mode: Annotated[
+            Literal["nonEmpty", "all", "positiveOnly", "negativeOnly", "empty"],
+            Field(description="Stock filter. Default nonEmpty."),
+        ] = "nonEmpty",
+        date: Annotated[str, Field(description="Stock as of this date YYYY-MM-DD.")] = "",
+    ) -> dict[str, Any]:
+        """Stock split by warehouse: units, reserved and available per store (a
+        where-is-my-inventory summary). Use get_stock for per-product cost/value."""
+        rows = await api.get_stock_by_store(
+            StockOptions(stock_mode=stock_mode, group_by="product", moment=date)
+        )
+        return as_object(aggregate.stock_by_store(rows))
+
+    @mcp.tool()
+    async def get_sales(
+        kind: Annotated[
+            Literal["sales", "orders"],
+            Field(description="sales = shipped demand; orders = customer orders. Default sales."),
+        ] = "sales",
+        date_from: Annotated[str, Field(description="Period start YYYY-MM-DD.")] = "",
+        date_to: Annotated[str, Field(description="Period end YYYY-MM-DD.")] = "",
+        interval: Annotated[
+            Literal["hour", "day", "month"], Field(description="Series interval. Default day.")
+        ] = "day",
+        store_id: Annotated[str, Field(description="Scope to a warehouse UUID.")] = "",
+        organization_id: Annotated[str, Field(description="Scope to an own-company UUID.")] = "",
+        project_id: Annotated[str, Field(description="Scope to a project UUID.")] = "",
+    ) -> dict[str, Any]:
+        """Sales or orders as a time series: quantity and amount per interval, plus totals.
+        No dates ⇒ previous full month. Base currency."""
+        if not date_from and not date_to:
+            date_from, date_to = prev_month(now())
+        series = await api.get_sales_series(
+            kind,
+            date_from,
+            date_to,
+            interval,
+            store_id=store_id,
+            organization_id=organization_id,
+            project_id=project_id,
+        )
+        return as_object(aggregate.sales_series(kind, series))
+
+    @mcp.tool()
+    async def get_audit(
+        entity_type: Annotated[
+            str, Field(description="Filter by entity type, e.g. customerorder, demand, product.")
+        ] = "",
+        event_type: Annotated[
+            str, Field(description="Filter by event: create, update, delete.")
+        ] = "",
+        limit: Annotated[int, Field(description="Max rows. Default 100.")] = 100,
+    ) -> dict[str, Any]:
+        """Account change log: who changed what and when (moment, employee, entity/event
+        type). Newest first. Use to answer 'what changed recently'."""
+        filters: list[str] = []
+        if entity_type:
+            filters.append(f"entityType={entity_type}")
+        if event_type:
+            filters.append(f"eventType={event_type}")
+        rows = await api.get_audit(filters, clamp_limit(limit))
+        return as_object(aggregate.audit(rows))
 
     @mcp.tool()
     async def get_account_currency() -> dict[str, Any]:

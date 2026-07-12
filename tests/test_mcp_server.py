@@ -6,6 +6,8 @@ import pytest
 from chic.mcpserver import build_server
 from chic.moysklad import DocumentQuery, ListOptions, ProfitOptions, StockOptions
 from chic.moysklad.models import (
+    AssortmentRow,
+    AuditRow,
     Counterparty,
     CounterpartyRow,
     Currency,
@@ -13,12 +15,18 @@ from chic.moysklad.models import (
     DashboardCount,
     DashboardMoney,
     Document,
+    EntityRef,
     MoneySeries,
     NamedRef,
     Product,
     ProfitByEntityRow,
     ProfitByProductRow,
+    SalesSeries,
+    SalesSeriesPoint,
+    State,
+    StockByStoreRow,
     StockRow,
+    StoreStock,
     TurnoverRow,
 )
 
@@ -87,6 +95,56 @@ class FakeAPI:
         self.calls["get_document"] = (str(doc_type), doc_id, expand)
         return Document(id=doc_id, name="INV-1", sum=100000)
 
+    async def list_entity_refs(self, entity: str, opts: ListOptions) -> list[EntityRef]:
+        self.calls["list_entity_refs"] = (entity, opts)
+        return [EntityRef(id="s1", name="Main warehouse", code="MW")]
+
+    async def search_assortment(self, opts: ListOptions) -> list[AssortmentRow]:
+        self.calls["search_assortment"] = opts
+        row = AssortmentRow(id="a1", name="Bundle", sale_prices=[])
+        row.meta.type = "bundle"
+        return [row]
+
+    async def list_states(self, doc_type: str) -> list[State]:
+        self.calls["list_states"] = str(doc_type)
+        return [State(id="st1", name="Новый", state_type="Regular", entity_type="customerorder")]
+
+    async def get_stock_by_store(self, opts: StockOptions) -> list[StockByStoreRow]:
+        self.calls["get_stock_by_store"] = opts
+        return [
+            StockByStoreRow(
+                stock_by_store=[StoreStock(name="Main", stock=10, reserve=3, in_transit=0)]
+            )
+        ]
+
+    async def get_sales_series(
+        self,
+        kind: str,
+        date_from: str,
+        date_to: str,
+        interval: str,
+        *,
+        store_id: str = "",
+        organization_id: str = "",
+        project_id: str = "",
+    ) -> SalesSeries:
+        self.calls["get_sales_series"] = (kind, date_from, date_to, interval, store_id)
+        return SalesSeries(
+            series=[SalesSeriesPoint(date="2026-01-01 00:00:00", quantity=5, sum=100000)]
+        )
+
+    async def get_audit(self, filters: list[str], limit: int) -> list[AuditRow]:
+        self.calls["get_audit"] = (filters, limit)
+        return [
+            AuditRow(
+                moment="2026-01-02 10:00:00",
+                uid="user@acme",
+                entity_type="customerorder",
+                event_type="update",
+                object_count=1,
+            )
+        ]
+
 
 async def _call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     server = build_server(FakeAPI())
@@ -99,10 +157,19 @@ async def test_all_tools_registered() -> None:
     server = build_server(FakeAPI())
     tools = await server.list_tools()
     names = {t.name for t in tools}
-    assert len(names) == 16
+    assert len(names) == 22
     assert "get_dashboard" in names
     assert "receivables_aging" in names
     assert "get_account_currency" in names
+    for name in (
+        "list_references",
+        "list_document_states",
+        "search_assortment",
+        "get_stock_by_store",
+        "get_sales",
+        "get_audit",
+    ):
+        assert name in names
 
 
 async def test_get_dashboard_camelcase_output() -> None:
@@ -163,6 +230,82 @@ async def test_search_counterparty_wrapped() -> None:
     out = await _call("search_counterparty", {"query": "acme"})
     assert out["count"] == 1
     assert out["items"][0]["name"] == "Acme"
+
+
+async def test_list_references_passes_kind_and_archived_filter() -> None:
+    api = FakeAPI()
+    server = build_server(api)
+    out = cast(
+        "tuple[Any, dict[str, Any]]",
+        await server.call_tool("list_references", {"kind": "store"}),
+    )[1]
+    entity, opts = api.calls["list_entity_refs"]
+    assert entity == "store"
+    assert "archived=false" in opts.filter
+    assert out["items"][0]["name"] == "Main warehouse"
+
+
+async def test_list_references_skips_archived_filter_for_non_archivable() -> None:
+    # country/uom/group have no `archived` attribute — the filter would 400.
+    for kind in ("country", "uom", "group"):
+        api = FakeAPI()
+        server = build_server(api)
+        await server.call_tool("list_references", {"kind": kind})
+        _, opts = api.calls["list_entity_refs"]
+        assert opts.filter == []
+
+
+async def test_search_documents_scoping_filters_reach_query() -> None:
+    api = FakeAPI()
+    server = build_server(api)
+    await server.call_tool(
+        "search_documents",
+        {"type": "retaildemand", "store_id": "s1", "organization_id": "o1", "state_id": "st1"},
+    )
+    _, query = api.calls["search_documents"]
+    assert query.store_id == "s1"
+    assert query.organization_id == "o1"
+    assert query.state_id == "st1"
+
+
+async def test_list_document_states_output() -> None:
+    out = await _call("list_document_states", {"document_type": "customerorder"})
+    assert out["items"][0]["name"] == "Новый"
+    assert out["items"][0]["type"] == "Regular"
+
+
+async def test_search_assortment_reports_kind() -> None:
+    out = await _call("search_assortment", {"query": "bundle"})
+    assert out["items"][0]["kind"] == "bundle"
+
+
+async def test_stock_by_store_aggregates_per_warehouse() -> None:
+    out = await _call("get_stock_by_store", {})
+    assert out["totals"]["stores"] == 1
+    assert out["rows"][0]["store"] == "Main"
+    assert out["rows"][0]["available"] == 7.0
+
+
+async def test_get_sales_defaults_to_prev_month_and_sums() -> None:
+    api = FakeAPI()
+    server = build_server(api)
+    out = cast(
+        "tuple[Any, dict[str, Any]]",
+        await server.call_tool("get_sales", {"kind": "orders"}),
+    )[1]
+    kind, date_from, date_to, _interval, _store = api.calls["get_sales_series"]
+    assert kind == "orders"
+    assert date_from and date_to  # prev-month default filled in
+    assert out["totalSum"] == 1000.0
+
+
+async def test_get_audit_builds_filters() -> None:
+    api = FakeAPI()
+    server = build_server(api)
+    await server.call_tool("get_audit", {"entity_type": "demand", "event_type": "create"})
+    filters, _ = api.calls["get_audit"]
+    assert "entityType=demand" in filters
+    assert "eventType=create" in filters
 
 
 async def test_invalid_enum_rejected() -> None:

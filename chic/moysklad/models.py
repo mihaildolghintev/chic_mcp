@@ -7,6 +7,8 @@ ignored so unknown fields never break decoding, mirroring the Go structs that
 only declared the fields the aggregation layer reads.
 """
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -253,6 +255,20 @@ class Position(MSModel):
     assortment: NamedRef = Field(default_factory=NamedRef)
 
 
+class Attribute(MSModel):
+    """A custom (доп. поле) attribute on a document or entity.
+
+    ``value`` is polymorphic: a scalar for simple types, or a nested object (with
+    its own ``name``) for custom-entity / linked references — the aggregation
+    layer flattens it to a display value.
+    """
+
+    id: str = ""
+    name: str = ""
+    type: str = ""
+    value: Any = None
+
+
 class Document(MSModel):
     meta: Meta = Field(default_factory=Meta)
     id: str = ""
@@ -274,3 +290,100 @@ class Document(MSModel):
     state: NamedRef | None = None
     rate: Rate | None = None
     positions: ListResponse[Position] | None = None
+    attributes: list[Attribute] = Field(default_factory=list)
+
+
+# ---- entity dictionaries (generic reference) ------------------------------
+
+
+class EntityRef(MSModel):
+    """A lean row for any reference dictionary (store, organization, sales
+    channel, employee, project, expense item, product folder, contract…).
+
+    ``extra='ignore'`` lets one model absorb the varied per-entity fields; only
+    the identifiers useful for discovering a UUID to feed other tools are kept.
+    """
+
+    meta: Meta = Field(default_factory=Meta)
+    id: str = ""
+    name: str = ""
+    code: str = ""
+    external_code: str = ""
+    archived: bool = False
+    description: str = ""
+    path_name: str = ""  # productfolder: parent path
+    inn: str = ""  # organization
+
+
+# ---- entity/{type}/metadata → states --------------------------------------
+
+
+class State(MSModel):
+    meta: Meta = Field(default_factory=Meta)
+    id: str = ""
+    name: str = ""
+    state_type: str = ""  # Regular | Successful | Unsuccessful
+    entity_type: str = ""
+
+
+class EntityMetadata(MSModel):
+    """Only the ``states`` collection of an ``/entity/{type}/metadata`` response."""
+
+    states: list[State] = Field(default_factory=list)
+
+
+# ---- entity/assortment ----------------------------------------------------
+
+
+class AssortmentRow(MSModel):
+    meta: Meta = Field(default_factory=Meta)
+    id: str = ""
+    name: str = ""
+    code: str = ""
+    article: str = ""
+    archived: bool = False
+    sale_prices: list[SalePrice] = Field(default_factory=list)
+    buy_price: BuyPrice | None = None
+    quantity: float = 0.0  # stock, when the report populates it
+
+
+# ---- report/stock/bystore -------------------------------------------------
+
+
+class StoreStock(MSModel):
+    meta: Meta = Field(default_factory=Meta)
+    name: str = ""  # warehouse name
+    stock: float = 0.0
+    reserve: float = 0.0
+    in_transit: float = 0.0
+
+
+class StockByStoreRow(MSModel):
+    meta: Meta = Field(default_factory=Meta)
+    stock_by_store: list[StoreStock] = Field(default_factory=list)
+
+
+# ---- report/sales|orders/plotseries ---------------------------------------
+
+
+class SalesSeriesPoint(MSModel):
+    date: str = ""
+    quantity: float = 0.0
+    sum: float = 0.0  # minor units
+
+
+class SalesSeries(MSModel):
+    series: list[SalesSeriesPoint] = Field(default_factory=list)
+
+
+# ---- audit ----------------------------------------------------------------
+
+
+class AuditRow(MSModel):
+    id: str = ""
+    moment: str = ""
+    uid: str = ""  # employee login that made the change
+    source: str = ""
+    entity_type: str = ""
+    event_type: str = ""  # create | update | delete | …
+    object_count: int = 0
