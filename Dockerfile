@@ -40,6 +40,8 @@ FROM base AS runtime
 ARG VERSION=dev
 ENV APP_VERSION=${VERSION}
 COPY --from=deps /opt/venv /opt/venv
+# The runtime user owns /data; a fresh chic_data volume inherits this ownership,
+# so SQLite can create and write app.db/cache.db.
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --no-create-home app \
     && mkdir -p /data && chown app:app /data
