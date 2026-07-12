@@ -51,4 +51,4 @@ make run        # run the runtime image locally (needs .env)
 ### Known follow-ups (not blocking the bot)
 - **Public `/mcp` endpoint**: the agent uses FastMCP in-process; the external `/mcp` HTTP endpoint (Go's `MCP_BEARER_TOKEN`-gated route) is not wired yet — the deploy leaves it off, so prod is unaffected.
 - **Model ids**: `deepseek-v4-flash` / `gpt-5.4-mini` carried over from Go as defaults — verify against provider docs before first real traffic (config.py TODO).
-- **Cutover**: the Go tree (`cmd/`, `internal/`, `go.mod`) stays in-tree as reference, excluded from the image via `.dockerignore`; delete it when merging `python-rewrite`.
+- **Cutover**: ✅ done — the Go tree (`cmd/`, `internal/`, `go.mod`, `go.sum`, `.golangci.yml`, `scripts/ci.sh`) has been removed; the project is Python-only.
