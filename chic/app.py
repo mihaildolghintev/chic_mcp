@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -62,9 +61,7 @@ async def _build_agent(settings: Settings, store: Store, api: Source) -> ChicAge
 
 
 def _make_bot(settings: Settings, agent: ChicAgent) -> ChicBot:
-    annotator = PhoenixAnnotator.from_env(
-        settings.phoenix_collector_endpoint, os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
-    )
+    annotator = PhoenixAnnotator(settings.phoenix_collector_endpoint)
 
     async def on_feedback(span_id: str, rating: str, user_id: int, _chat_id: int) -> None:
         like = rating == "like"
