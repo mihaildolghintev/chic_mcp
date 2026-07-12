@@ -1,11 +1,11 @@
 """The bot's brain: a pydantic-ai agent over the MoySklad MCP tools.
 
 Faithful port of the Go agent. The MoySklad tools are forwarded to the
-in-process FastMCP server; ``ask_user`` is a virtual tool intercepted as a
-terminal turn (the human's choice returns as the next message); rolling summary
-and preference consolidation are hand-rolled (rune budgets + injection-hardening
-that no framework owns). Token stop-loss and round cap use pydantic-ai's
-``UsageLimits``.
+in-process FastMCP server; an ambiguous request ends the run with a ``Clarify``
+structured output — a normal terminal result, not an exception (the human's
+choice returns as the next message); rolling summary and preference
+consolidation are hand-rolled (rune budgets + injection-hardening that no
+framework owns). Token stop-loss and round cap use pydantic-ai's ``UsageLimits``.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent, ImageUrl, RunContext
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -76,20 +77,25 @@ class _Deps:
     now: datetime
 
 
-def _parse_ask_user(question: str, options: list[str], allow_custom: bool) -> Result:
+class Clarify(BaseModel):
+    """Уточняющий вопрос пользователю, когда запрос неоднозначный (неясен период,
+    склад, единица и т.п.). Верни это вместо ответа, а не спрашивай текстом."""
+
+    question: str = Field(min_length=1, description="Короткий вопрос на языке пользователя")
+    options: list[str] = Field(
+        default_factory=list, description="2–4 взаимоисключающих варианта ответа"
+    )
+    allow_custom: bool = Field(
+        default=False, description="true, если уместен свободный ответ текстом"
+    )
+
+
+def _clarify_result(question: str, options: list[str], allow_custom: bool) -> Result:
     q = question.strip()
     opts = [o.strip() for o in options if o.strip()]
     if len(opts) < 2:  # not a real choice → plain-text question
         return Result(text=q)
     return Result(text=q, options=opts, allow_custom=allow_custom)
-
-
-class _AskUser(Exception):
-    """Raised by the ask_user tool to end the run and bounce a question to the human."""
-
-    def __init__(self, question: str, options: list[str], allow_custom: bool) -> None:
-        self.result = _parse_ask_user(question, options, allow_custom)
-        super().__init__(question)
 
 
 def _collapse(s: str) -> str:
@@ -167,7 +173,7 @@ class ChicAgent:
         store: Store,
         text_model: OpenAIChatModel,
         vision_model: OpenAIChatModel | None,
-        agent: Agent[_Deps, str],
+        agent: Agent[_Deps, str | Clarify],
         summary_agent: Agent[None, str],
         consolidate_agent: Agent[None, str],
         currency_code: str,
@@ -233,7 +239,12 @@ class ChicAgent:
             )
 
         tools = await _build_moysklad_tools(fastmcp)
-        agent: Agent[_Deps, str] = Agent(text_model, deps_type=_Deps, tools=tools)
+        # output_type=[str, Clarify]: a plain answer stays text; an ambiguous
+        # request finalises with a Clarify object via the built-in output tool —
+        # a successful terminal result, so the run never trips an error status.
+        agent: Agent[_Deps, str | Clarify] = Agent(
+            text_model, deps_type=_Deps, tools=tools, output_type=[str, Clarify]
+        )
 
         summary_agent: Agent[None, str] = Agent(text_model, instructions=SUMMARY_SYSTEM_PROMPT)
         consolidate_agent: Agent[None, str] = Agent(
@@ -282,21 +293,22 @@ class ChicAgent:
             await ctx.deps.store.delete_preference(ctx.deps.user_id, key)
             return f"OK: предпочтение {key} удалено"
 
-        @agent.tool_plain
-        async def ask_user(question: str, options: list[str], allow_custom: bool = False) -> str:
-            """Задать пользователю уточняющий вопрос с 2–4 взаимоисключающими вариантами,
-            когда запрос неоднозначный (неясен период, склад, единица и т.п.). Обработка
-            останавливается до ответа пользователя."""
-            if not question.strip():
-                return "ERROR: ask_user требует непустой question и минимум 2 варианта в options"
-            raise _AskUser(question, options, allow_custom)
-
         return self
 
     # ---- public API -------------------------------------------------------
 
     async def reset(self, user_id: int) -> None:
         await self._store.start_session(user_id)
+
+    async def session_key(self, user_id: int) -> str:
+        """Stable Phoenix session id for the user's current conversation.
+
+        ``session_epoch`` is the id of the last ``/new`` boundary, so the key
+        rolls over exactly when the user starts a fresh conversation — aligning
+        Phoenix's Sessions view with the bot's own session concept.
+        """
+        epoch = await self._store.session_epoch(user_id)
+        return f"{user_id}:{epoch}"
 
     async def preferences(self, user_id: int) -> list[Preference]:
         return await self._store.preferences(user_id)
@@ -349,14 +361,17 @@ class ChicAgent:
                 model=model,
                 usage_limits=limits,
             )
-        except _AskUser as ask:
-            await self._persist(user_id, stored, ask.result.text)
-            return ask.result
         except UsageLimitExceeded:
             logger.warning("usage limit tripped for user %d", user_id)
             return Result(text=MSG_BUDGET_SPENT)
 
-        answer = (result.output or "").strip()
+        out = result.output
+        if isinstance(out, Clarify):  # ambiguous request → clarifying question
+            res = _clarify_result(out.question, out.options, out.allow_custom)
+            await self._persist(user_id, stored, res.text)
+            return res
+
+        answer = out.strip()
         await self._persist(user_id, stored, answer)
         return Result(text=answer)
 

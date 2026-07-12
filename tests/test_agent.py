@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest_asyncio
 from chic.agent import ChicAgent
-from chic.agent.agent import _parse_ask_user, _parse_consolidated, _RateLimiter
+from chic.agent.agent import _clarify_result, _parse_consolidated, _RateLimiter
 from chic.store import Store
 from mcp.server.fastmcp import FastMCP
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
@@ -46,14 +46,14 @@ def test_rate_limiter_unlimited() -> None:
     assert all(rl.allow(UID, 1000.0) for _ in range(100))
 
 
-def test_parse_ask_user_degrades_below_two_options() -> None:
-    r = _parse_ask_user("Вопрос?", ["один"], False)
+def test_clarify_result_degrades_below_two_options() -> None:
+    r = _clarify_result("Вопрос?", ["один"], False)
     assert r.text == "Вопрос?"
     assert r.options == []
 
 
-def test_parse_ask_user_keeps_options() -> None:
-    r = _parse_ask_user("Период?", ["день", "неделя"], True)
+def test_clarify_result_keeps_options() -> None:
+    r = _clarify_result("Период?", ["день", "неделя"], True)
     assert r.options == ["день", "неделя"]
     assert r.allow_custom is True
 
@@ -84,12 +84,14 @@ async def test_plain_answer_is_persisted(agent: ChicAgent) -> None:
     ]
 
 
-async def test_ask_user_returns_a_clarifying_question(agent: ChicAgent) -> None:
-    def ask(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+async def test_clarify_output_returns_a_clarifying_question(agent: ChicAgent) -> None:
+    def ask(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        # An ambiguous request finalises via the built-in output tool (final_result),
+        # not a bespoke ask_user tool — a successful terminal result, not an error.
         return ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="ask_user",
+                    tool_name=info.output_tools[0].name,
                     args={"question": "Какой период?", "options": ["день", "неделя"]},
                 )
             ]

@@ -39,6 +39,7 @@ from chic.moysklad.options import (
     QueryParams,
     StockOptions,
 )
+from chic.tracing import http_span, record_http_response
 
 DEFAULT_BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
 DEFAULT_PAGE_LIMIT = 1000
@@ -96,41 +97,43 @@ class MoyskladClient:
     async def _do_get(self, path: str, params: QueryParams) -> bytes:
         url = self._base_url + path
         last_err: Exception | None = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                async with self._limiter:
-                    # httpx's param type is invariant and rejects list[tuple[str, str]].
-                    resp = await self._http.get(
-                        url,
-                        params=params,  # type: ignore[arg-type]
-                        headers=self._headers(),
-                    )
-            except httpx.HTTPError as exc:
-                last_err = exc
-                await self._backoff(attempt, 0.0)
-                continue
+        with http_span("GET", path, url, params) as span:
+            for attempt in range(self._max_retries + 1):
+                try:
+                    async with self._limiter:
+                        # httpx's param type is invariant and rejects list[tuple[str, str]].
+                        resp = await self._http.get(
+                            url,
+                            params=params,  # type: ignore[arg-type]
+                            headers=self._headers(),
+                        )
+                except httpx.HTTPError as exc:
+                    last_err = exc
+                    await self._backoff(attempt, 0.0)
+                    continue
 
-            body = resp.content
-            status = resp.status_code
-            if 200 <= status < 300:
-                return body
-            if status == 429:
-                last_err = parse_api_error(status, body)
-                if attempt == self._max_retries:
-                    raise last_err
-                await self._backoff(attempt, _retry_after(resp.headers))
-                continue
-            if status >= 500:
-                last_err = parse_api_error(status, body)
-                if attempt == self._max_retries:
-                    raise last_err
-                await self._backoff(attempt, 0.0)
-                continue
-            raise parse_api_error(status, body)
+                body = resp.content
+                status = resp.status_code
+                record_http_response(span, status, body)
+                if 200 <= status < 300:
+                    return body
+                if status == 429:
+                    last_err = parse_api_error(status, body)
+                    if attempt == self._max_retries:
+                        raise last_err
+                    await self._backoff(attempt, _retry_after(resp.headers))
+                    continue
+                if status >= 500:
+                    last_err = parse_api_error(status, body)
+                    if attempt == self._max_retries:
+                        raise last_err
+                    await self._backoff(attempt, 0.0)
+                    continue
+                raise parse_api_error(status, body)
 
-        if last_err is None:  # unreachable: the loop always sets last_err before exhausting
-            raise RuntimeError("moysklad: request failed without an error")
-        raise last_err
+            if last_err is None:  # unreachable: the loop always sets last_err before exhausting
+                raise RuntimeError("moysklad: request failed without an error")
+            raise last_err
 
     async def _backoff(self, attempt: int, retry_after: float) -> None:
         delay = retry_after if retry_after > 0 else self._base_delay * (2**attempt)
