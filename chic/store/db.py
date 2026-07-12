@@ -15,7 +15,7 @@ from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Connection, delete, event, func, inspect, select
+from sqlalchemy import Connection, delete, event, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -26,15 +26,10 @@ _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
 def _run_migrations(sync_connection: Connection) -> None:
-    """Bring the schema to head, adopting a pre-Alembic (Go/goose) DB if present."""
+    """Apply Alembic migrations to head on the store's own connection."""
     cfg = Config()
     cfg.set_main_option("script_location", str(_MIGRATIONS_DIR))
     cfg.attributes["connection"] = sync_connection
-    tables = set(inspect(sync_connection).get_table_names())
-    if "alembic_version" not in tables and "messages" in tables:
-        # The Go/goose build created the schema without Alembic bookkeeping;
-        # stamp it at the baseline so upgrade() doesn't re-create existing tables.
-        command.stamp(cfg, "0001")
     command.upgrade(cfg, "head")
 
 
